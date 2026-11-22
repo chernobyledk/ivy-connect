@@ -329,6 +329,12 @@ internal sealed class Controls
             return new ReplyRow(String.Join(".", id), parts, OwnMessage(bubble));
         }).ToArray();
     }
+
+    internal string HistoryLocator()
+    {
+        var id = History == null ? null : History.GetRuntimeId();
+        return id == null || id.Length == 0 ? null : String.Join(".", id);
+    }
     internal string ExternalFieldEvidence(string key, string selfId, string peerId)
     {
         var bubble = Bubbles.Single(e => String.Join(".", e.GetRuntimeId()) == key);

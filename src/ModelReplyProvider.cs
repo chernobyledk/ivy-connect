@@ -1,16 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
 using System.Linq;
-using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
-using System.Runtime.Serialization;
-using System.Runtime.Serialization.Json;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Web.Script.Serialization;
 
 internal sealed class ModelReplyException : InvalidOperationException
 {
@@ -36,254 +34,279 @@ internal static class ModelReplyContext
     }
 }
 
-internal sealed class DeepSeekPrivateReply : IPrivateReplyProvider, IDisposable
+internal sealed class ModelMessage
 {
-    [DataContract]
-    private sealed class ChatMessage
+    internal readonly string Role, Text;
+    internal ModelMessage(string role, string text) { Role = role; Text = text; }
+}
+
+internal static class ModelWire
+{
+    internal static Dictionary<string, object> Request(PrivateModelSettings settings, Uri endpoint, IEnumerable<ModelMessage> messages)
     {
-        [DataMember(Name = "role")] internal string Role;
-        [DataMember(Name = "content")] internal string Content;
+        var body = new Dictionary<string, object> { { "model", settings.Model }, { "stream", false } };
+        if (settings.Protocol == ModelCapabilities.Responses)
+        {
+            body["store"] = false;
+            body["max_output_tokens"] = settings.OutputTokens == 0 ? 4096 : settings.OutputTokens;
+            body["input"] = messages.Select(message => new {
+                type = "message", role = message.Role,
+                content = new[] { new { type = message.Role == "assistant" ? "output_text" : "input_text", text = message.Text } }
+            }).ToArray();
+        }
+        else
+        {
+            var preset = ModelCapabilities.Preset(settings.Provider);
+            var options = ModelCapabilities.Thinking(settings, endpoint);
+            int standard = settings.Provider == PrivateModelSettings.OpenAi ? 1200 :
+                (settings.Provider == PrivateModelSettings.DeepSeek && (options.Switch == null || settings.ThinkingMode == "disabled")) ||
+                settings.Provider == PrivateModelSettings.Compatible ? 700 : 4096;
+            body[preset.Budget] = settings.OutputTokens == 0 ? standard : settings.OutputTokens;
+            if (settings.Provider == ModelCapabilities.MiniMax &&
+                (settings.Model == "MiniMax-M3" || settings.Model == "MiniMax-M3.1-Flash")) body["reasoning_split"] = true;
+            if (settings.Provider == PrivateModelSettings.OpenAi) body["store"] = false;
+            body["messages"] = messages.Select(message => new { role = message.Role, content = message.Text }).ToArray();
+        }
+        ModelCapabilities.ApplyThinking(settings, endpoint, body);
+        return body;
     }
 
-    [DataContract]
-    private sealed class Thinking
+    internal static string Answer(Dictionary<string, object> packet, PrivateModelSettings settings)
     {
-        [DataMember(Name = "type")] internal string Type = "disabled";
+        if (Field(packet, "error") != null) throw ApiError(200, packet, settings);
+        var baseResponse = Map(Field(packet, "base_resp"));
+        if (Field(baseResponse, "status_code") != null && Verbatim(baseResponse, "status_code") != "0")
+            throw ApiError(200, packet, settings);
+        var raw = settings.Protocol == ModelCapabilities.Responses ? ResponsesText(packet, settings) : ChatText(packet);
+        var text = (raw ?? "").Trim();
+        if (String.IsNullOrWhiteSpace(text)) throw new ModelReplyException("empty", "服务没有返回可发送的最终正文");
+        if (Regex.IsMatch(text, @"<\s*/?\s*(?:think|analysis|reasoning)(?:\s|>|/)", RegexOptions.IgnoreCase))
+            throw new ModelReplyException("thinking", "最终正文混有思考标签，已跳过");
+        if (text.Length > 2000) throw new ModelReplyException("length", "模型最终回答超出 2000 字，已跳过");
+        if (new[] { settings.ApiKey, settings.ProxyPassword, settings.ProxyUser }
+            .Any(secret => !String.IsNullOrEmpty(secret) && text.IndexOf(secret, StringComparison.Ordinal) >= 0))
+            throw new ModelReplyException("sensitive", "最终回答疑似包含凭据，已跳过");
+        return text;
     }
 
-    [DataContract]
-    private sealed class ChatRequest
+    private static string ChatText(Dictionary<string, object> packet)
     {
-        [DataMember(Name = "model")] internal string Model;
-        [DataMember(Name = "stream")] internal bool Stream = false;
-        [DataMember(Name = "max_tokens", EmitDefaultValue = false)] internal int? MaxTokens;
-        [DataMember(Name = "max_completion_tokens", EmitDefaultValue = false)] internal int? MaxCompletionTokens;
-        [DataMember(Name = "thinking", EmitDefaultValue = false)] internal Thinking ThinkingMode;
-        [DataMember(Name = "reasoning_effort", EmitDefaultValue = false)] internal string Effort;
-        [DataMember(Name = "messages")] internal ChatMessage[] Messages;
+        var choices = List(Field(packet, "choices"));
+        var choice = choices == null ? null : choices.Select(Map).FirstOrDefault();
+        if (choice == null) throw Format("Chat Completions 响应缺少 choices");
+        var finish = Text(choice, "finish_reason");
+        if (finish == "length") throw BudgetExhausted();
+        if (finish != "stop") throw new ModelReplyException("finish", "Chat Completions 未完成普通文本回复，已跳过");
+        var message = Map(Field(choice, "message"));
+        if (Text(message, "role") != "assistant") throw Format("Chat Completions 响应缺少助手消息");
+        var tools = List(Field(message, "tool_calls"));
+        if (Field(message, "refusal") is string || (tools != null && tools.Length > 0) ||
+            Field(message, "function_call") != null)
+            throw new ModelReplyException("finish", "服务返回拒绝或工具内容，未发送");
+        var content = Field(message, "content");
+        var parts = List(content);
+        return parts == null ? content as string : String.Concat(parts.Select(Map)
+            .Where(x => Text(x, "type") == "text").Select(x => Text(x, "text")));
     }
 
-    [DataContract]
-    private sealed class Choice
+    private static string ResponsesText(Dictionary<string, object> packet, PrivateModelSettings settings)
     {
-        [DataMember(Name = "message")] internal ChatMessage Message { get; set; }
-        [DataMember(Name = "finish_reason")] internal string FinishReason { get; set; }
+        var state = Text(packet, "status");
+        if (state == "incomplete" && Text(Map(Field(packet, "incomplete_details")), "reason") == "max_output_tokens")
+            throw BudgetExhausted();
+        if (state == "failed" && Field(packet, "error") != null) throw ApiError(200, packet, settings);
+        if (state != "completed") throw new ModelReplyException("finish", "Responses 未完成普通文本回复，已跳过");
+        var output = List(Field(packet, "output"));
+        if (output == null) throw Format("Responses 响应缺少 output");
+        var messages = output.Select(Map).Where(item => Text(item, "type") == "message" &&
+            Text(item, "role") == "assistant" && (Text(item, "status") == null || Text(item, "status") == "completed") &&
+            (Text(item, "phase") == null || Text(item, "phase") == "final_answer"));
+        return String.Join("\n", messages.Select(message => String.Concat((List(Field(message, "content")) ?? new object[0])
+            .Select(Map).Where(part => Text(part, "type") == "output_text").Select(part => Text(part, "text"))))
+            .Where(text => !String.IsNullOrWhiteSpace(text)));
     }
 
-    [DataContract]
-    private sealed class ChatResponse
+    internal static Dictionary<string, object> Decode(string text)
     {
-        [DataMember(Name = "choices")] internal Choice[] Choices { get; set; }
+        try
+        {
+            var parsed = Map(new JavaScriptSerializer { MaxJsonLength = 1048576, RecursionLimit = 48 }.DeserializeObject(text));
+            if (parsed != null) return parsed;
+        }
+        catch (ArgumentException) { }
+        catch (InvalidOperationException) { }
+        throw Format("响应不是约定的 JSON 对象");
     }
 
-    [DataContract]
-    private sealed class BalanceResponse
+    internal static Dictionary<string, object> Map(object node) { return node as Dictionary<string, object>; }
+    internal static object[] List(object node) { return node as object[]; }
+    internal static object Field(Dictionary<string, object> node, string key)
     {
-        [DataMember(Name = "is_available")] internal bool? Available { get; set; }
+        object value;
+        return node != null && node.TryGetValue(key, out value) ? value : null;
     }
+    internal static string Text(Dictionary<string, object> node, string key) { return Field(node, key) as string; }
+    private static string Verbatim(Dictionary<string, object> node, string key) { return Convert.ToString(Field(node, key)); }
 
-    [DataContract]
-    private sealed class ModelList
+    internal static ModelReplyException Format(string reason) { return new ModelReplyException("format", reason); }
+    private static ModelReplyException BudgetExhausted()
+    { return new ModelReplyException("output-budget", "模型耗尽输出配额，未取得完整最终正文。可增加输出上限或降低思考用量。"); }
+
+    internal static ModelReplyException ApiError(int status, Dictionary<string, object> packet, PrivateModelSettings settings)
     {
-        [DataMember(Name = "object")] internal string Type { get; set; }
-        [DataMember(Name = "data")] internal ModelItem[] Models { get; set; }
+        var error = Map(Field(packet, "error"));
+        var code = Verbatim(error, "code");
+        if (code.Length == 0) code = Verbatim(packet, "code");
+        if (code.Length == 0) code = Verbatim(error, "type");
+        var suffix = status == 200 ? "" : "（HTTP " + status + "）";
+        if (status == 407) return new ModelReplyException("proxy-auth", "代理认证未通过" + suffix);
+        if (status == 401 || code == "invalid_api_key" || code == "API_KEY_INVALID")
+            return new ModelReplyException("auth", "模型 API 鉴权失败" + suffix);
+        if (code == "unsupported_country_region_territory" || code == "unsupported_region" || code == "region_not_supported")
+            return new ModelReplyException("region", "服务明确返回地区限制" + suffix);
+        if (status == 403) return new ModelReplyException("permission", "服务拒绝访问，请检查权限、区域或账号资格" + suffix);
+        if (code == "model_not_found" || code == "ModelNotFound" || code == "InvalidEndpointOrModel.NotFound")
+            return new ModelReplyException("model-not-found", "服务未找到模型或当前账号无权使用它" + suffix);
+        if (status == 402 || code == "insufficient_quota" || code == "insufficient_balance" ||
+            code == "Arrearage" || (settings.Provider == ModelCapabilities.MiniMax &&
+                Verbatim(Map(Field(packet, "base_resp")), "status_code") == "1008"))
+            return new ModelReplyException("quota", "模型服务提示额度或余额不足" + suffix);
+        if (status == 429) return new ModelReplyException("rate-limit", "模型请求被限流，未自动重试" + suffix);
+        if (status == 408 || status == 504) return new ModelReplyException("timeout", "服务端请求超时" + suffix);
+        if (status == 400 || status == 422)
+            return new ModelReplyException("request-parameters", "服务拒绝请求参数或协议" + suffix +
+                (settings.ThinkingMode != "default" || settings.ThinkingEffort != "default" ? "。本次包含思考参数。" : "。") +
+                "未更换参数或重试。");
+        if (status == 404) return new ModelReplyException("endpoint-or-model", "请求地址、资源或模型未找到" + suffix);
+        return new ModelReplyException(status == 200 ? "service-error" : "http-" + status,
+            "模型服务返回错误" + suffix + "，未自动重试");
     }
+}
 
-    [DataContract]
-    private sealed class ModelItem
-    {
-        [DataMember(Name = "id")] internal string Id { get; set; }
-    }
-
+internal sealed class HttpPrivateReply : IPrivateReplyProvider, IDisposable
+{
     private readonly HttpClient client;
     private readonly PrivateModelSettings settings;
     private readonly Uri endpoint;
     private readonly Func<PrivateModelTurn[]> context;
     private readonly Action<string> log;
 
-    internal DeepSeekPrivateReply(PrivateModelSettings settings, Func<PrivateModelTurn[]> context, Action<string> log)
+    internal HttpPrivateReply(PrivateModelSettings settings, Func<PrivateModelTurn[]> context, Action<string> log, bool listOnly = false)
     {
         this.settings = settings.Copy();
         this.context = context;
         this.log = log;
-        endpoint = this.settings.Validate();
-        var handler = new HttpClientHandler { AllowAutoRedirect = false, UseCookies = false,
-            UseDefaultCredentials = false, UseProxy = !endpoint.IsLoopback };
-        client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan, MaxResponseContentBufferSize = 262144 };
+        endpoint = this.settings.Validate(true, !listOnly);
+        client = new HttpClient(ModelNetwork.Handler(this.settings)) {
+            Timeout = Timeout.InfiniteTimeSpan, MaxResponseContentBufferSize = 1048576
+        };
     }
 
     public async Task<ReplyDraft> GenerateAsync(PrivateEvent incoming, CancellationToken cancellation)
     {
         if (incoming == null || String.IsNullOrWhiteSpace(incoming.Body) || incoming.Body.Length > 2000)
             throw new ModelReplyException("input", "来信文本为空或超出 2000 字，已暂停该回复");
-        var messages = new List<ChatMessage>();
+        var messages = new List<ModelMessage>();
         if (!String.IsNullOrWhiteSpace(settings.RolePrompt))
-            messages.Add(new ChatMessage { Role = "system", Content = settings.RolePrompt });
+            messages.Add(new ModelMessage("system", settings.RolePrompt));
         foreach (var turn in ModelReplyContext.Recent(context() ?? new PrivateModelTurn[0], settings.ContextTurns))
         {
-            messages.Add(new ChatMessage { Role = "user", Content = turn.User });
-            messages.Add(new ChatMessage { Role = "assistant", Content = turn.Assistant });
+            messages.Add(new ModelMessage("user", turn.User));
+            messages.Add(new ModelMessage("assistant", turn.Assistant));
         }
-        messages.Add(new ChatMessage { Role = "user", Content = incoming.Body });
-        var answer = await Complete(messages.ToArray(), incoming.LocalId, cancellation).ConfigureAwait(false);
+        messages.Add(new ModelMessage("user", incoming.Body));
+        var answer = await Complete(messages, incoming.LocalId, cancellation).ConfigureAwait(false);
         return new ReplyDraft(answer, null, settings.ContextTurns);
     }
 
     internal Task<string> TestAsync(CancellationToken cancellation)
     {
-        return Complete(new[] { new ChatMessage { Role = "user", Content = "请只回复：连接正常。" } }, "connection-test", cancellation);
+        return Complete(new[] { new ModelMessage("user", "请只回复：连接正常。") }, "connection-test", cancellation);
     }
 
     internal async Task<string> ProbeAsync(CancellationToken cancellation)
     {
-        using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
+        if (settings.Provider == PrivateModelSettings.DeepSeek && ModelCapabilities.IsOfficialDeepSeek(endpoint))
         {
-            deadline.CancelAfter(TimeSpan.FromSeconds(Math.Min(15, settings.TimeoutSeconds)));
+            var packet = await Send(HttpMethod.Get, new UriBuilder(endpoint) { Path = "/user/balance" }.Uri, null, cancellation).ConfigureAwait(false);
+            var result = ModelWire.Field(packet, "is_available") as bool?;
+            if (!result.HasValue) throw ModelWire.Format("未识别到 DeepSeek 鉴权响应");
+            return result.Value ? "auth-ready" : "auth-no-balance";
+        }
+        await ListAsync(cancellation).ConfigureAwait(false);
+        return "models";
+    }
+
+    internal async Task<string[]> ListAsync(CancellationToken cancellation)
+    {
+        var address = ModelCapabilities.ModelsAddress(endpoint, settings.Provider);
+        if (address == null) throw new ModelReplyException("models-unsupported", "当前地址的官方列表接口未配置，请手工填写模型 ID");
+        var packet = await Send(HttpMethod.Get, address, null, cancellation).ConfigureAwait(false);
+        if (ModelWire.Field(packet, "error") != null) throw ModelWire.ApiError(200, packet, settings);
+        var qwen = settings.Provider == ModelCapabilities.Qwen;
+        if (qwen && !Equals(ModelWire.Field(packet, "success"), true)) throw ModelWire.ApiError(200, packet, settings);
+        var models = ModelWire.List(qwen ? ModelWire.Field(ModelWire.Map(ModelWire.Field(packet, "output")), "models") :
+            ModelWire.Field(packet, "data"));
+        if (models == null) throw ModelWire.Format("此地址未返回约定的模型列表");
+        return models.Select(ModelWire.Map).Select(item => ModelWire.Text(item, qwen ? "model" : "id"))
+            .Where(PrivateModelSettings.IsModelId)
+            .Where(id => id != settings.ApiKey && id != settings.ProxyUser && id != settings.ProxyPassword)
+            .Distinct(StringComparer.Ordinal).Take(250).ToArray();
+    }
+
+    private async Task<string> Complete(IEnumerable<ModelMessage> messages, string correlation, CancellationToken cancellation)
+    {
+        var elapsed = Stopwatch.StartNew();
+        log("model request id=" + correlation + " protocol=" + settings.Protocol + " network=" + settings.Network + " messages=" + messages.Count());
+        try
+        {
+            var body = new JavaScriptSerializer().Serialize(ModelWire.Request(settings, endpoint, messages));
+            var packet = await Send(HttpMethod.Post, endpoint, body, cancellation).ConfigureAwait(false);
+            cancellation.ThrowIfCancellationRequested();
+            var answer = ModelWire.Answer(packet, settings);
+            cancellation.ThrowIfCancellationRequested();
+            log("model ok id=" + correlation + " answer-length=" + answer.Length + " elapsed-ms=" + elapsed.ElapsedMilliseconds);
+            return answer;
+        }
+        catch (OperationCanceledException) { log("model cancelled id=" + correlation); throw; }
+        catch (ModelReplyException error) { log("model error id=" + correlation + " code=" + error.Code); throw; }
+    }
+
+    private async Task<Dictionary<string, object>> Send(HttpMethod method, Uri destination, string body, CancellationToken cancellation)
+    {
+        if (!ModelCapabilities.SameOrigin(endpoint.AbsoluteUri, destination.AbsoluteUri))
+            throw new ModelReplyException("endpoint", "检查地址和生成地址不同源，已取消请求");
+        using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
+        using (var request = new HttpRequestMessage(method, destination))
+        {
+            deadline.CancelAfter(TimeSpan.FromSeconds(settings.TimeoutSeconds));
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.ApiKey);
+            if (body != null) request.Content = new StringContent(body, Encoding.UTF8, "application/json");
             try
             {
-                using (var request = new HttpRequestMessage(HttpMethod.Get, ModelCapabilities.ProbeAddress(endpoint)))
+                using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseContentRead, deadline.Token).ConfigureAwait(false))
                 {
-                    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.ApiKey);
-                    using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseContentRead, deadline.Token).ConfigureAwait(false))
-                    {
-                        if (!response.IsSuccessStatusCode) throw StatusError(response.StatusCode);
-                        var data = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-                        deadline.Token.ThrowIfCancellationRequested();
-                        if (ModelCapabilities.IsOfficialDeepSeek(endpoint))
-                        {
-                            var balance = ParseJson<BalanceResponse>(data);
-                            if (balance == null || !balance.Available.HasValue) throw new ModelReplyException("format", "未识别到 DeepSeek 官方鉴权响应");
-                            return balance.Available.Value ? "auth-ready" : "auth-no-balance";
-                        }
-                        var models = ParseJson<ModelList>(data);
-                        if (models == null || models.Type != "list" || models.Models == null ||
-                            models.Models.Any(item => item == null || String.IsNullOrWhiteSpace(item.Id)))
-                            throw new ModelReplyException("format", "此地址未返回约定的模型列表");
-                        return "models";
-                    }
+                    var text = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    deadline.Token.ThrowIfCancellationRequested();
+                    if (response.IsSuccessStatusCode) return ModelWire.Decode(text);
+                    Dictionary<string, object> packet = null;
+                    try { packet = ModelWire.Decode(text); }
+                    catch (ModelReplyException) { }
+                    throw ModelWire.ApiError((int)response.StatusCode, packet, settings);
                 }
             }
             catch (OperationCanceledException)
             {
                 if (cancellation.IsCancellationRequested) throw;
-                throw new ModelReplyException("timeout", "轻量检查超时");
+                throw new ModelReplyException("timeout", "模型请求超时，未自动重试");
             }
-            catch (HttpRequestException) { throw new ModelReplyException("connection", "轻量检查连接失败或响应超限"); }
-            catch (SerializationException) { throw new ModelReplyException("format", "轻量检查没有返回约定格式"); }
-        }
-    }
-
-    private ChatRequest Request(ChatMessage[] messages)
-    {
-        var value = new ChatRequest { Model = settings.Model, Messages = messages };
-        if (settings.Provider == PrivateModelSettings.OpenAi) value.MaxCompletionTokens = 1200;
-        else value.MaxTokens = ModelCapabilities.SupportsThinking(settings, endpoint) && settings.ThinkingMode != "disabled" ? 4096 : 700;
-        if (settings.ThinkingMode != "default") value.ThinkingMode = new Thinking { Type = settings.ThinkingMode };
-        if (settings.ThinkingEffort != "default") value.Effort = settings.ThinkingEffort;
-        return value;
-    }
-
-    private async Task<string> Complete(ChatMessage[] messages, string correlation, CancellationToken cancellation)
-    {
-        var elapsed = Stopwatch.StartNew();
-        log("model request id=" + correlation + " messages=" + messages.Length);
-        using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
-        {
-            deadline.CancelAfter(TimeSpan.FromSeconds(settings.TimeoutSeconds));
-            try
+            catch (HttpRequestException error)
             {
-                using (var request = new HttpRequestMessage(HttpMethod.Post, endpoint))
-                {
-                    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.ApiKey);
-                    using (var data = new MemoryStream())
-                    {
-                        new DataContractJsonSerializer(typeof(ChatRequest)).WriteObject(data,
-                            Request(messages));
-                        request.Content = new ByteArrayContent(data.ToArray());
-                    }
-                    request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-                    using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseContentRead, deadline.Token).ConfigureAwait(false))
-                    {
-                        if (!response.IsSuccessStatusCode)
-                        {
-                            int status = (int)response.StatusCode;
-                            if (settings.ThinkingMode != "default" && (status == 400 || status == 422))
-                                throw new ModelReplyException("request-parameters", "模型拒绝本次请求（HTTP " + status + "）。此请求含思考参数，请检查所选模型和强度。未换档或重试");
-                            throw StatusError(response.StatusCode);
-                        }
-                        var data = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
-                        deadline.Token.ThrowIfCancellationRequested();
-                        string answer = Parse(data);
-                        if (answer.IndexOf(settings.ApiKey, StringComparison.Ordinal) >= 0)
-                            throw new ModelReplyException("sensitive", "答案疑似包含当前密钥，已跳过");
-                        deadline.Token.ThrowIfCancellationRequested();
-                        log("model ok id=" + correlation + " answer-length=" + answer.Length + " elapsed-ms=" + elapsed.ElapsedMilliseconds);
-                        return answer;
-                    }
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                if (cancellation.IsCancellationRequested)
-                {
-                    log("model cancelled id=" + correlation);
-                    throw;
-                }
-                log("model error id=" + correlation + " code=timeout");
-                throw new ModelReplyException("timeout", "模型请求超时，未重试");
-            }
-            catch (HttpRequestException)
-            {
-                if (cancellation.IsCancellationRequested) throw new OperationCanceledException(cancellation);
-                log("model error id=" + correlation + " code=connection");
-                throw new ModelReplyException("connection", "模型连接失败或响应超过大小限制");
-            }
-            catch (ModelReplyException error)
-            {
-                log("model error id=" + correlation + " code=" + error.Code);
-                throw;
+                cancellation.ThrowIfCancellationRequested();
+                if (deadline.IsCancellationRequested) throw new ModelReplyException("timeout", "模型请求超时，未自动重试");
+                throw ModelNetwork.TransportError(error, settings.Network);
             }
         }
-    }
-
-    private static ModelReplyException StatusError(HttpStatusCode status)
-    {
-        int code = (int)status;
-        if (code == 401 || code == 403) return new ModelReplyException("auth", "模型鉴权失败（HTTP " + code + "）");
-        if (code == 429) return new ModelReplyException("rate-limit", "模型服务限流（HTTP 429），未自动重试");
-        if (code == 408 || code == 504) return new ModelReplyException("timeout", "模型服务超时（HTTP " + code + "）");
-        return new ModelReplyException("http-" + code, "模型接口返回 HTTP " + code + "，未自动重试");
-    }
-
-    private static string Parse(byte[] bytes)
-    {
-        ChatResponse packet;
-        try
-        {
-            packet = ParseJson<ChatResponse>(bytes);
-        }
-        catch (SerializationException)
-        {
-            throw new ModelReplyException("format", "模型响应不是约定的 Chat Completions JSON");
-        }
-        var choice = packet == null || packet.Choices == null ? null : packet.Choices.FirstOrDefault();
-        if (choice == null || choice.Message == null || choice.Message.Role != "assistant")
-            throw new ModelReplyException("format", "模型响应缺少标准的助手消息");
-        if (choice.FinishReason != "stop")
-            throw new ModelReplyException("finish", "模型未正常完成文本回答，已跳过");
-        string text = choice.Message.Content == null ? null : choice.Message.Content.Trim();
-        if (String.IsNullOrWhiteSpace(text)) throw new ModelReplyException("empty", "模型最终回答为空");
-        if (Regex.IsMatch(text, @"<\s*/?\s*(?:think|analysis|reasoning)(?:\s|>|/)", RegexOptions.IgnoreCase))
-            throw new ModelReplyException("thinking", "答案夹带思考标签，已跳过");
-        if (text.Length > 2000)
-            throw new ModelReplyException("length", "模型最终回答超出 2000 字，已跳过");
-        return text;
-    }
-
-    private static T ParseJson<T>(byte[] bytes)
-    {
-        using (var buffer = new MemoryStream(bytes))
-            return (T)new DataContractJsonSerializer(typeof(T)).ReadObject(buffer);
     }
 
     public void Dispose() { client.Dispose(); }

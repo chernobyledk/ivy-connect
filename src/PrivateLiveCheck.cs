@@ -49,8 +49,8 @@ internal sealed class PrivateLiveCheck : Form
         {
             var s = File.ReadAllLines(settings, Encoding.UTF8);
             if (s.Length < 8 || !Regex.IsMatch(s[6], "^[A-F0-9]{12}$") ||
-                !new[] { "send", "send-side", "send-receipt", "restart", "restart-real", "recover", "cleanup", "send-model-mock", "send-model-real", "send-model-profile" }.Contains(s[7]) ||
-                s.Length != (s[7] == "send-model-mock" || s[7] == "send-model-real" || s[7] == "send-model-profile" ? 9 : 8))
+                !new[] { "send", "send-side", "send-receipt", "restart", "restart-real", "recover", "cleanup", "send-model-mock", "send-model-real", "send-model-profile", "send-model-quiet" }.Contains(s[7]) ||
+                s.Length != (s[7].StartsWith("send-model-", StringComparison.Ordinal) ? 9 : 8))
                 throw new InvalidOperationException("真机验证配置无效");
             if (s[7] == "send-model-mock")
             {
@@ -100,7 +100,7 @@ internal sealed class PrivateLiveCheck : Form
             }
             await PrepareEditor(Target.FromKnownHandle(Int64.Parse(s[2])), s[3], s[4], "peer", control.Token, Log);
             await PrepareEditor(target, proof.PeerDisplay, proof.HeaderProof, "bot", control.Token, Log);
-            if (s[7] == "send-side" || s[7] == "send-model-real" || s[7] == "send-model-profile" || s[7] == "send-receipt")
+            if (s[7] == "send-side" || s[7] == "send-model-real" || s[7] == "send-model-profile" || s[7] == "send-model-quiet" || s[7] == "send-receipt")
             {
                 await Task.Run(() => QqConnection.VerifyUnique(proof, control.Token.ThrowIfCancellationRequested, Log), control.Token);
                 beforeMove = Native.Bounds(target.Hwnd);
@@ -119,32 +119,45 @@ internal sealed class PrivateLiveCheck : Form
             if (x + width > work.Right) throw new InvalidOperationException("目标旁边没有专用便笺空间");
             Bounds = new Rectangle(x, work.Top + 215, width, 64);
             if (Native.GetForegroundWindow() != Handle) Activate(); // test-owned control, before measurement
+            bool quiet = s[7] == "send-model-quiet";
             using (var cover = new PictureCoverController(output, Log))
-            using (var pad = new TypingPad(new Rectangle(x, work.Top + 20, width, 175), automaticMarker: s[6]))
+            using (var pad = quiet ? null : new TypingPad(new Rectangle(x, work.Top + 20, width, 175), automaticMarker: s[6]))
             {
                 cover.Show(target);
-                for (int i = 0; i < 60 && pad.Hwnd == IntPtr.Zero; i++) await Task.Delay(100, control.Token);
-                var padWindow = pad.Hwnd;
-                if (padWindow == IntPtr.Zero) throw new InvalidOperationException("专用便笺未启动");
-                Native.SetForegroundWindow(padWindow);
-                for (int i = 0; i < 60 &&
-                    (Native.GetForegroundWindow() != padWindow || !Native.HasChildFocus(padWindow) || pad.AutomaticSteps == 0); i++)
-                    await Task.Delay(100, control.Token);
+                var foreground = IntPtr.Zero;
+                if (pad != null)
+                {
+                    for (int i = 0; i < 60 && pad.Hwnd == IntPtr.Zero; i++) await Task.Delay(100, control.Token);
+                    foreground = pad.Hwnd;
+                    if (foreground == IntPtr.Zero) throw new InvalidOperationException("专用便笺未启动");
+                    Native.SetForegroundWindow(foreground);
+                    for (int i = 0; i < 60 &&
+                        (Native.GetForegroundWindow() != foreground || !Native.HasChildFocus(foreground) || pad.AutomaticSteps == 0); i++)
+                        await Task.Delay(100, control.Token);
+                }
                 var coverWindow = cover.Window;
                 if (coverWindow == IntPtr.Zero || Native.IsTopmost(coverWindow))
                     throw new InvalidOperationException("图片遮罩未建立为普通非置顶窗口");
                 await Task.Delay(900, control.Token);
+                if (quiet)
+                {
+                    foreground = Native.GetForegroundWindow();
+                    if (foreground == IntPtr.Zero || foreground == coverWindow || Native.Pid(foreground) == target.Pid ||
+                        Native.Pid(foreground) == Native.Pid(new IntPtr(Int64.Parse(s[2]))))
+                        throw new InvalidOperationException("静默全遮挡对照未建立独立前台，未发送");
+                }
                 using (var trace = new ForegroundTrace())
                 {
                     var effects = new SideEffects();
-                    var steps = pad.AutomaticSteps;
-                    var losses = pad.AutomaticFocusLoss;
-                    var changes = pad.AutomaticMismatch;
+                    var steps = pad == null ? 0 : pad.AutomaticSteps;
+                    var losses = pad == null ? 0 : pad.AutomaticFocusLoss;
+                    var changes = pad == null ? 0 : pad.AutomaticMismatch;
                     Log("run pid=" + Process.GetCurrentProcess().Id + " mode=" + s[7] + " condition=expanded-fully-covered" +
-                        " geometry=" + outer + " dpi=" + Native.GetDpiForWindow(target.Hwnd) + " setup-activation=pad-only");
+                        " geometry=" + outer + " dpi=" + Native.GetDpiForWindow(target.Hwnd) +
+                        (quiet ? " setup=verified-non-QQ-foreground-no-typing" : " setup-activation=pad-only"));
                     Action guard = () => {
                         control.Token.ThrowIfCancellationRequested();
-                        bool front = Native.GetForegroundWindow() == padWindow, focus = Native.HasChildFocus(padWindow),
+                        bool front = Native.GetForegroundWindow() == foreground, focus = quiet || Native.HasChildFocus(foreground),
                             opened = !Native.IsIconic(target.Hwnd), shown = Native.Visible(coverWindow),
                             above = Native.Above(coverWindow, target.Hwnd), unchanged = Native.Bounds(target.Hwnd) == outer,
                             full = Rectangle.Intersect(Native.Bounds(coverWindow), outer) == outer;
@@ -158,9 +171,9 @@ internal sealed class PrivateLiveCheck : Form
                     {
                         effects.Dispose();
                         Log("foreground-events count=" + trace.Count + " " + trace.Summary());
-                        Log("input-evidence " + effects.Describe(false) + " automated-pad-steps=" + (pad.AutomaticSteps - steps) +
-                            " pad-focus-loss=" + (pad.AutomaticFocusLoss - losses) + " pad-text-mismatch=" +
-                            (pad.AutomaticMismatch - changes) + " human-typing=not-tested");
+                        Log("input-evidence " + effects.Describe(false) + (quiet ? " automated-pad=not-used" :
+                            " automated-pad-steps=" + (pad.AutomaticSteps - steps) + " pad-focus-loss=" + (pad.AutomaticFocusLoss - losses) +
+                            " pad-text-mismatch=" + (pad.AutomaticMismatch - changes)) + " human-typing=not-tested");
                     }
                 }
             }
@@ -269,13 +282,13 @@ internal sealed class PrivateLiveCheck : Form
 
     private void Verify(string[] s, string output, bool restart, PrivateBindingProof proof, Target target, Action guard)
     {
-        var realModel = s[7] == "send-model-real" || s[7] == "send-model-profile" || s[7] == "restart-real";
+        var realModel = s[7] == "send-model-real" || s[7] == "send-model-profile" || s[7] == "send-model-quiet" || s[7] == "restart-real";
         var forceReceiptRestart = s[7] == "send-receipt";
         using (var store = new PrivateStore(output))
         using (var transport = new QqPrivateTransport(proof, guard, Log))
-        using (var model = s[7] == "send-model-profile" ? new DeepSeekPrivateReply(ModelCatalogFile.Load(s[8]).Active.Settings, () => store.State.ModelTurns, Log) :
-            s[7] == "send-model-real" ? new DeepSeekPrivateReply(ModelSettingsFile.Load(s[8]), () => store.State.ModelTurns, Log) :
-            s[7] == "send-model-mock" ? new DeepSeekPrivateReply(new PrivateModelSettings {
+        using (var model = s[7] == "send-model-profile" || s[7] == "send-model-quiet" ? new HttpPrivateReply(ModelCatalogFile.Load(s[8]).Active.Settings, () => store.State.ModelTurns, Log) :
+            s[7] == "send-model-real" ? new HttpPrivateReply(ModelSettingsFile.Load(s[8]), () => store.State.ModelTurns, Log) :
+            s[7] == "send-model-mock" ? new HttpPrivateReply(new PrivateModelSettings {
             Endpoint = s[8], Model = "mock-qq", ApiKey = "test-only-placeholder-never-real",
             TimeoutSeconds = 8, ContextTurns = 2, RolePrompt = "Use short answers."
         }, () => store.State.ModelTurns, Log) : null)

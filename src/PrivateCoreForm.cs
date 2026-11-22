@@ -525,10 +525,13 @@ internal sealed class PrivateCoreForm : Form
         {
             var current = ModelCatalogFile.Load(folder).Active;
             modelSummary.Text = current == null ? "尚未选择当前模型配置。" :
-                current.Name + " · " + current.Settings.Provider + " · " + current.Settings.Model +
+                current.Name + " · " + (ModelCapabilities.Preset(current.Settings.Provider) == null ? current.Settings.Provider :
+                    ModelCapabilities.Preset(current.Settings.Provider).Label) + " · " + current.Settings.Model +
                 "\r\n思考 " + ModelCapabilities.DescribeThinking(current.Settings) + " · " + current.Availability() +
                 (String.IsNullOrEmpty(current.Settings.ApiKey) ? " · 无密钥" : " · 密钥 ••••••••");
-            if (runningModelName != null) modelSummary.Text += "\r\n运行中使用「" + runningModelName + "」的启动快照";
+            if (runningModelName != null) modelSummary.Text += "\r\n运行中使用「" + runningModelName + "」的启动快照，修改下次启动生效";
+            else if (current != null) modelSummary.Text += "\r\n" + ModelCapabilities.ProtocolLabel(current.Settings.Protocol) +
+                " · " + ModelNetwork.Label(current.Settings.Network);
         }
         catch (Exception) { modelSummary.Text = "模型配置无法解密或读取。请检查「模型与密钥」。"; }
     }
@@ -700,7 +703,11 @@ internal sealed class PrivateCoreForm : Form
             pause.Text = "暂停";
             SetConnection("已就绪", "正在重新建立消息基线…");
             UpdateButtons();
-            try { SetConnection("已停止", await Task.Run(() => Watch(connected, snapshot, active))); }
+            try
+            {
+                var ending = await Task.Run(() => Watch(connected, snapshot, active));
+                SetConnection(ending.Item1, ending.Item2);
+            }
             catch (OperationCanceledException) { SetConnection("已停止", "请点击「开始回复」再次核验并启动。"); }
             catch (Exception ex) { SetConnection("未连接", "启动已停止。" + ModelConfigForm.DisplayError(ex)); }
             finally { run = null; liveProof = null; runningModelName = null; RefreshModelSummary(); Finished(); }
@@ -711,48 +718,48 @@ internal sealed class PrivateCoreForm : Form
             await ArrangeQq("restore");
         }
     }
-    private string Watch(PrivateBindingProof connected, PrivateModelSettings snapshot, PrivateRunControl active)
+    private Tuple<string, string> Watch(PrivateBindingProof connected, PrivateModelSettings snapshot, PrivateRunControl active)
     {
         using (var store = new PrivateStore(folder))
         {
             var proof = store.State.Binding;
             if (proof == null || proof.RouteStamp() != connected.RouteStamp())
                 throw new PrivateRouteLostException("连接后核验记录已变更，请重新连接原私聊");
-            using (var modelReply = snapshot != null ? new DeepSeekPrivateReply(snapshot,
+            using (var modelReply = snapshot != null ? new HttpPrivateReply(snapshot,
                 () => store.State.ModelTurns, Log) : null)
             using (var transport = new QqPrivateTransport(proof, active.Token.ThrowIfCancellationRequested, Log))
             {
                 IPrivateReplyProvider reply = modelReply == null ? (IPrivateReplyProvider)new FixedPrivateReply(item => "已收到，谢谢。") : modelReply;
                 var core = new PrivateReplyCore(store, transport, reply, active, acceptIncoming, Log,
-                    progress: text => Report(text, "核查中"));
+                    progress: text => Report(text));
                 core.Start(proof.BotQq, proof.PeerQq);
-                if (core.RecoveryBlocked) return Summary(store, "已有提交需要核实，新的发送保持暂停。");
-                Report(Summary(store, "监听已绑定私聊"), "运行中");
+                if (core.RecoveryBlocked) return Tuple.Create("已提交待确认", Summary(store, "已有提交需要核实，新的发送保持暂停。"));
+                Report(Summary(store, "等待新消息 · 可见气泡 " + core.VisibleRows), "运行中");
                 try
                 {
                     while (!active.Token.WaitHandle.WaitOne(400))
                     {
                         if (active.Paused) continue;
-                        try { core.Tick(); Report(Summary(store, "监听已绑定私聊"), "运行中"); }
+                        try { core.Tick(); Report(Summary(store, "等待新消息 · 可见气泡 " + core.VisibleRows), "运行中"); }
                         catch (OperationCanceledException) { throw; }
                         catch (Exception ex)
                         {
                             var reason = ModelConfigForm.DisplayError(ex);
                             Log("halt " + reason);
-                            if (core.RecoveryBlocked) return Summary(store, "提交结果待确认 · " + reason);
+                            if (core.RecoveryBlocked) return Tuple.Create("已提交待确认", Summary(store, "提交结果待确认 · " + reason));
                             if (core.BindingInvalidated)
                             {
                                 BeginInvoke(new Action(() => pictureCover.Close()));
-                                return Summary(store, "旧绑定的未提交任务已取消 · " + reason);
+                                return Tuple.Create("需要重新核验", Summary(store, "旧绑定的未提交任务已取消 · " + reason));
                             }
                             active.Pause();
-                            Report(Summary(store, "已暂停 · " + reason), "暂停");
+                            Report(Summary(store, "已暂停 · " + reason), ex is ModelReplyException ? "网络或模型错误" : "暂停");
                         }
                     }
                 }
                 catch (OperationCanceledException) { }
                 finally { core.StopUnsubmitted(); }
-                return Summary(store, "已停止");
+                return Tuple.Create("已停止", Summary(store, "已停止"));
             }
         }
     }

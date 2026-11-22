@@ -180,7 +180,7 @@ internal static class ModelChecks
 
     private static void Error(LoopbackDeepSeek server, string model, string expected, int seconds = 8)
     {
-        using (var reply = new DeepSeekPrivateReply(Settings(server, model, seconds), () => new PrivateModelTurn[0], Ignore))
+        using (var reply = new HttpPrivateReply(Settings(server, model, seconds), () => new PrivateModelTurn[0], Ignore))
         {
             try { reply.TestAsync(CancellationToken.None).GetAwaiter().GetResult(); }
             catch (ModelReplyException ex) { Assert(ex.Code == expected, model + " -> " + expected); return; }
@@ -203,7 +203,7 @@ internal static class ModelChecks
         var progress = new List<string>();
         using (var store = new PrivateStore(folder))
         using (var control = new PrivateRunControl())
-        using (var model = new DeepSeekPrivateReply(Settings(server, "test-repeat"), () => store.State.ModelTurns, progress.Add))
+        using (var model = new HttpPrivateReply(Settings(server, "test-repeat"), () => store.State.ModelTurns, progress.Add))
         {
             var core = Core(store, wire, model, control);
             for (int i = 0; i < 3; i++)
@@ -239,7 +239,7 @@ internal static class ModelChecks
         var wire = new Wire();
         using (var store = new PrivateStore(folder))
         using (var control = new PrivateRunControl())
-        using (var model = new DeepSeekPrivateReply(Settings(server, "test-delay"), () => store.State.ModelTurns, Ignore))
+        using (var model = new HttpPrivateReply(Settings(server, "test-delay"), () => store.State.ModelTurns, Ignore))
         {
             var core = Core(store, wire, model, control);
             wire.Add("late");
@@ -297,7 +297,7 @@ internal static class ModelChecks
                 if (ui) { CheckForm(root); return; }
                 Assert(ModelSettingsFile.Load(file).ApiKey == LoopbackDeepSeek.Key &&
                     !Encoding.UTF8.GetString(File.ReadAllBytes(file)).Contains(LoopbackDeepSeek.Key), "model key DPAPI roundtrip");
-                using (var model = new DeepSeekPrivateReply(settings, () => { throw new Exception("unexpected private context"); }, Ignore))
+                using (var model = new HttpPrivateReply(settings, () => { throw new Exception("unexpected private context"); }, Ignore))
                     Assert(model.TestAsync(CancellationToken.None).GetAwaiter().GetResult() == "最终回答",
                         "connection probe uses no private context and only consumes final answer");
                 Error(server, "test-auth", "auth");
@@ -341,7 +341,7 @@ internal static class ModelChecks
             both.Profiles.Single(item => item.Id == second.Id).Settings.ApiKey == LoopbackDeepSeek.AlternateKey,
             "two independently encrypted credentials reload with the manual selection intact");
         var delayedSettings = first.Settings;
-        using (var running = new DeepSeekPrivateReply(delayedSettings, () => new PrivateModelTurn[0], Ignore))
+        using (var running = new HttpPrivateReply(delayedSettings, () => new PrivateModelTurn[0], Ignore))
         {
             server.Delayed.Reset();
             var pending = running.TestAsync(CancellationToken.None);
@@ -358,12 +358,13 @@ internal static class ModelChecks
         catalog = ModelCatalogFile.Load(folder);
         Assert(catalog.Active.Id == second.Id && catalog.Active.Settings.ApiKey == LoopbackDeepSeek.AlternateKey &&
             catalog.Profiles.Length == 1 && original.SequenceEqual(File.ReadAllBytes(legacyPath)), "current selection and independent key survive reopening encrypted catalog");
-        using (var reply = new DeepSeekPrivateReply(catalog.Active.Settings, () => new PrivateModelTurn[0], Ignore))
+        using (var reply = new HttpPrivateReply(catalog.Active.Settings, () => new PrivateModelTurn[0], Ignore))
         {
             reply.TestAsync(CancellationToken.None).GetAwaiter().GetResult();
             Assert(server.ObservedRequests.Any(item => item.StartsWith("test-secondary/secondary/")), "new client uses selected configuration and its own key");
-            Assert(reply.ProbeAsync(CancellationToken.None).GetAwaiter().GetResult() == "models" && server.ObservedRequests.Contains("GET/models"),
-                "lightweight check sends exactly the same-origin models GET");
+            try { reply.ProbeAsync(CancellationToken.None).GetAwaiter().GetResult(); throw new Exception("guessed list"); }
+            catch (ModelReplyException error) { Assert(error.Code == "models-unsupported" && !server.ObservedRequests.Contains("GET/models"),
+                "self-defined address does not receive a speculative model-list request"); }
         }
 
         var deep = Settings(server, "deepseek-flash");
@@ -400,7 +401,7 @@ internal static class ModelChecks
         var copy = settings.Copy();
         copy.ThinkingMode = mode;
         copy.ThinkingEffort = effort;
-        using (var client = new DeepSeekPrivateReply(copy, () => new PrivateModelTurn[0], Ignore))
+        using (var client = new HttpPrivateReply(copy, () => new PrivateModelTurn[0], Ignore))
             client.TestAsync(CancellationToken.None).GetAwaiter().GetResult();
     }
 
@@ -417,8 +418,18 @@ internal static class ModelChecks
             var password = PrivateField<TextBox>(dialog, "key");
             Assert(role.Text == original.RolePrompt && password.UseSystemPasswordChar && password.Text == "",
                 "opening actual settings neither fills a saved key into text input nor replaces an existing role");
+            var services = PrivateField<ComboBox>(dialog, "provider");
+            var protocols = PrivateField<ComboBox>(dialog, "protocol");
+            Assert(services.Items.Count == 10 && PrivateField<TextBox>(dialog, "proxyUser").UseSystemPasswordChar &&
+                PrivateField<TextBox>(dialog, "proxyPassword").UseSystemPasswordChar &&
+                !PrivateField<TextBox>(dialog, "proxy").Enabled, "actual editor has the new presets and masks both proxy credential fields");
             var type = dialog.GetType();
             type.GetMethod("StartNew", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance).Invoke(dialog, null);
+            services.SelectedItem = ModelCapabilities.Preset(PrivateModelSettings.OpenAi);
+            Assert((string)protocols.SelectedItem == "Responses" && PrivateField<Label>(dialog, "resolved").Text ==
+                "https://api.openai.com/v1/responses", "provider selection shows the resolved official Responses route");
+            PrivateField<ComboBox>(dialog, "network").SelectedIndex = 2;
+            Assert(PrivateField<TextBox>(dialog, "proxy").Enabled, "custom proxy enables address entry");
             type.GetMethod("FillExample", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance).Invoke(dialog, null);
             Assert(PrivateField<TextBox>(dialog, "roleName").Text == "冰上Ivy" && role.Text.Contains("十六岁") &&
                 ModelCatalogFile.Load(folder).Active.Settings.RolePrompt == original.RolePrompt, "example fills only the editable draft after explicit action");

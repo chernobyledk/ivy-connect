@@ -18,20 +18,32 @@ internal sealed class ModelConfigForm : Form
     private readonly Label keyState = new Label { AutoSize = true };
     private readonly Label thinkingNote = new Label { AutoSize = true, Padding = new Padding(0, 3, 0, 0) };
     private readonly ListBox profiles = new ListBox { Dock = DockStyle.Fill };
-    private readonly ComboBox provider = DropDown(), thinking = DropDown(), effort = DropDown();
+    private readonly ComboBox provider = DropDown(), protocol = DropDown(), thinking = DropDown(), effort = DropDown(),
+        network = DropDown();
     private readonly TextBox name = new TextBox { MaxLength = 60 }, endpoint = new TextBox(), model = new TextBox(),
         key = new TextBox { UseSystemPasswordChar = true, MaxLength = 512, Width = 270 },
+        proxy = new TextBox { MaxLength = 256 }, proxyUser = new TextBox { UseSystemPasswordChar = true, MaxLength = 128, Width = 142 },
+        proxyPassword = new TextBox { UseSystemPasswordChar = true, MaxLength = 512, Width = 142 },
         roleName = new TextBox { MaxLength = 60 }, role = new TextBox { Multiline = true, MaxLength = 1200, ScrollBars = ScrollBars.Vertical };
     private readonly CheckBox removeKey = new CheckBox { Text = "清除密钥", AutoSize = true };
+    private readonly CheckBox removeProxyAuth = new CheckBox { Text = "清除认证", AutoSize = true };
     private readonly NumericUpDown timeout = new NumericUpDown { Minimum = 1, Maximum = 120 };
     private readonly NumericUpDown turns = new NumericUpDown { Minimum = 0, Maximum = 8 };
+    private readonly NumericUpDown output = new NumericUpDown { Minimum = 0, Maximum = 32768, Width = 85 };
     private readonly FlowLayoutPanel actions = new FlowLayoutPanel(), profileActions = new FlowLayoutPanel();
-    private readonly TableLayoutPanel editor = new TableLayoutPanel { Dock = DockStyle.Top, Height = 400, Padding = new Padding(8), ColumnCount = 2 };
+    private readonly TableLayoutPanel editor = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8), ColumnCount = 2 };
     private readonly Button identify = new Button { Text = "识别服务商", AutoSize = true };
+    private readonly Label resolved = new Label { AutoEllipsis = true, Padding = new Padding(0, 3, 0, 0) };
+    private readonly Label modelHint = new Label { AutoEllipsis = true, Padding = new Padding(0, 3, 0, 0) };
+    private readonly Label proxyState = new Label { AutoEllipsis = true, Padding = new Padding(0, 3, 0, 0) };
+    private readonly ToolTip tips = new ToolTip();
     private PrivateModelCatalog catalog;
     private PrivateModelProfile editing;
     private CancellationTokenSource active;
     private bool populating;
+    private string Provider { get { return ((ModelPreset)provider.SelectedItem ?? ModelCapabilities.Presets.Last()).Name; } }
+    private string Protocol { get { return protocol.SelectedIndex == 1 ? ModelCapabilities.Responses : ModelCapabilities.Chat; } }
+    private string Network { get { return network.SelectedIndex == 1 ? ModelNetwork.Direct : network.SelectedIndex == 2 ? ModelNetwork.Proxy : ModelNetwork.System; } }
 
     private static ComboBox DropDown() { return new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList }; }
     private static FlowLayoutPanel Line(params Control[] children)
@@ -54,15 +66,18 @@ internal sealed class ModelConfigForm : Form
         this.log = log;
         this.clearContext = clearContext;
         Text = "Ivy connect · 模型与密钥";
-        ClientSize = new Size(870, 627);
-        MinimumSize = new Size(790, 635);
+        ClientSize = new Size(955, 746);
+        MinimumSize = new Size(845, 610);
         StartPosition = FormStartPosition.CenterParent;
         var hint = new Label { Dock = DockStyle.Top, Height = 46, Padding = new Padding(8, 6, 8, 0), Text =
             (runningName == null ? "手动选择模型配置与密钥。" : "运行中的会话继续使用「" + runningName + "」的启动快照。") +
             "\r\n切换、编辑和删除在下一次停止并启动后生效。模型切换与当前 QQ 会话相互独立。" };
-        provider.Items.AddRange(ModelCapabilities.Providers);
-        thinking.Items.AddRange(new[] { "模型默认", "开启", "关闭" });
-        effort.Items.AddRange(new[] { "模型默认强度", "低 (low)", "高 (high)", "最高 (max)" });
+        provider.Items.AddRange(ModelCapabilities.Presets);
+        network.Items.AddRange(new[] { "跟随系统（默认）", "直接连接", "自定义 HTTP 代理" });
+        network.Width = 190;
+        tips.SetToolTip(proxy, "填已有代理的 http://地址:端口。HTTPS 模型仍验证服务器证书。");
+        tips.SetToolTip(proxyUser, "可选代理用户名。留空保留同一代理的已保存用户名。");
+        tips.SetToolTip(proxyPassword, "可选代理密码。留空保留同一代理的已保存密码。");
         editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 116));
         editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         var endpointRow = new TableLayoutPanel { ColumnCount = 2, Dock = DockStyle.Fill, Margin = Padding.Empty };
@@ -75,9 +90,12 @@ internal sealed class ModelConfigForm : Form
         var clearRole = ButtonFor("清空角色", () => { roleName.Clear(); role.Clear(); });
         var clearHistory = ButtonFor("清空聊天上下文…", clearContext);
         AddRow("配置名称", name);
-        AddRow("服务商 / 接口", provider);
-        AddRow("完整 API 地址", endpointRow, 32);
-        AddRow("模型名称", model);
+        AddRow("服务商", provider);
+        AddRow("接口类型", protocol);
+        AddRow("基础或完整 API 地址", endpointRow, 32);
+        AddRow("实际请求地址", resolved);
+        AddRow("模型 / 接入点 ID", model);
+        AddRow("填写提示", modelHint, 32);
         AddRow("替换 API 密钥", Line(key, removeKey), 30);
         AddRow("密钥状态", keyState);
         thinking.Width = 122;
@@ -85,13 +103,19 @@ internal sealed class ModelConfigForm : Form
         AddRow("思考强度", effort);
         AddRow("超时 / 上下文", Line(timeout, new Label { Text = "秒　保留", AutoSize = true }, turns,
             new Label { Text = "轮（0 为停用）", AutoSize = true }), 29);
+        AddRow("输出长度上限", Line(output, new Label { Text = "Token（0 为 Ivy 默认。思考可能占用输出预算）", AutoSize = true }));
+        AddRow("网络方式", network);
+        AddRow("HTTP 代理地址", proxy);
+        AddRow("代理用户名 / 密码", Line(proxyUser, proxyPassword, removeProxyAuth));
+        AddRow("代理认证状态", proxyState);
         AddRow("角色名称", roleName);
         AddRow("角色设定", role, 58);
         AddRow("角色操作", Line(sample, clearRole, clearHistory), 35);
         actions.Dock = DockStyle.Bottom;
-        actions.Height = 54;
+        actions.Height = 43;
         actions.Controls.AddRange(new[] { ButtonFor("加密保存", Save), ButtonFor("设为当前配置", SelectCurrent),
-            ButtonFor("轻量检查", async () => await Check(false)), ButtonFor("测试真实回答…", async () => await Check(true)) });
+            ButtonFor("轻量检查", async () => await Check("check")), ButtonFor("查询模型列表", async () => await Check("list")),
+            ButtonFor("测试真实回答…", async () => await Check("answer")) });
         profileActions.Dock = DockStyle.Bottom;
         profileActions.Height = 74;
         profileActions.Controls.AddRange(new[] { ButtonFor("新增", StartNew), ButtonFor("复制…", Duplicate), ButtonFor("删除…", Remove) });
@@ -99,23 +123,32 @@ internal sealed class ModelConfigForm : Form
         left.Controls.Add(profiles);
         left.Controls.Add(profileActions);
         var right = new Panel { Dock = DockStyle.Fill };
+        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
+        scroll.Controls.Add(editor);
+        result.Dock = DockStyle.Bottom;
+        result.Height = 48;
+        right.Controls.Add(scroll);
         right.Controls.Add(result);
         right.Controls.Add(actions);
-        right.Controls.Add(editor);
         Controls.Add(right);
         Controls.Add(left);
         Controls.Add(hint);
 
         identify.Click += (s, e) => Recognize();
-        provider.SelectedIndexChanged += (s, e) => UpdateThinking();
+        provider.SelectedIndexChanged += (s, e) => { if (!populating) ApplyPreset(); };
+        protocol.SelectedIndexChanged += (s, e) => { if (!populating) UpdateAddress(); };
         model.TextChanged += (s, e) => UpdateThinking();
-        endpoint.TextChanged += (s, e) => { UpdateThinking(); UpdateKeyState(); };
-        thinking.SelectedIndexChanged += (s, e) => UpdateThinking();
+        endpoint.TextChanged += (s, e) => { if (!populating) UpdateAddress(); };
+        thinking.SelectedIndexChanged += (s, e) => { if (!populating) UpdateThinking(); };
+        network.SelectedIndexChanged += (s, e) => UpdateProxyState();
+        proxy.TextChanged += (s, e) => UpdateProxyState();
+        removeProxyAuth.CheckedChanged += (s, e) => UpdateProxyState();
         removeKey.CheckedChanged += (s, e) => UpdateKeyState();
         profiles.SelectedIndexChanged += (s, e) => {
             if (!populating && profiles.SelectedItem is PrivateModelProfile) ShowProfile((PrivateModelProfile)profiles.SelectedItem);
         };
         FormClosing += (s, e) => { if (active != null) active.Cancel(); };
+        FormClosed += (s, e) => tips.Dispose();
         try
         {
             catalog = ModelCatalogFile.Load(folder);
@@ -155,38 +188,106 @@ internal sealed class ModelConfigForm : Form
         editing = profile;
         var values = profile == null ? new PrivateModelSettings() : profile.Settings;
         name.Text = profile == null ? "" : profile.Name;
-        provider.SelectedItem = values.Provider;
-        if (provider.SelectedIndex < 0) provider.SelectedIndex = 2;
+        provider.SelectedItem = ModelCapabilities.Preset(values.Provider) ?? ModelCapabilities.Presets.Last();
+        SetProtocols(values.Protocol);
         endpoint.Text = values.Endpoint;
         model.Text = values.Model;
         key.Clear();
         removeKey.Checked = false;
         roleName.Text = values.RoleName;
         role.Text = values.RolePrompt;
-        thinking.SelectedIndex = values.ThinkingMode == "enabled" ? 1 : values.ThinkingMode == "disabled" ? 2 : 0;
-        effort.SelectedIndex = Array.IndexOf(new[] { "default", "low", "high", "max" }, values.ThinkingEffort);
-        if (effort.SelectedIndex < 0) effort.SelectedIndex = 0;
         timeout.Value = Math.Max(1, Math.Min(120, values.TimeoutSeconds));
         turns.Value = Math.Max(0, Math.Min(8, values.ContextTurns));
+        output.Value = Math.Max(0, Math.Min(32768, values.OutputTokens));
+        network.SelectedIndex = values.Network == ModelNetwork.Proxy ? 2 : values.Network == ModelNetwork.Direct ? 1 : 0;
+        proxy.Text = values.ProxyAddress;
+        proxyUser.Clear();
+        proxyPassword.Clear();
+        removeProxyAuth.Checked = false;
         populating = false;
-        UpdateThinking();
-        UpdateKeyState();
+        UpdateAddress(values.ThinkingMode, values.ThinkingEffort);
+        UpdateProxyState();
         if (profile != null)
             result.Text = (catalog.ActiveId == profile.Id ? "当前配置 · " : "已保存 · ") + profile.Availability();
     }
 
-    private void UpdateThinking()
+    private sealed class Option
+    {
+        internal readonly string Id, Label;
+        internal Option(string id, string label) { Id = id; Label = label; }
+        public override string ToString() { return Label; }
+    }
+
+    private static string Selected(ComboBox control)
+    {
+        var option = control.SelectedItem as Option;
+        return option == null ? "default" : option.Id;
+    }
+
+    private static void Options(ComboBox control, Option[] choices, string value)
+    {
+        control.Items.Clear();
+        control.Items.AddRange(choices);
+        control.SelectedItem = choices.FirstOrDefault(option => option.Id == value) ?? choices[0];
+    }
+
+    private void SetProtocols(string selected)
+    {
+        var protocols = ModelCapabilities.Protocols(Provider);
+        protocol.Items.Clear();
+        protocol.Items.AddRange(protocols.Select(ModelCapabilities.ProtocolLabel).ToArray());
+        protocol.SelectedIndex = selected == ModelCapabilities.Responses && protocols.Length == 2 ? 1 : 0;
+    }
+
+    private void ApplyPreset()
+    {
+        var preset = ModelCapabilities.Preset(Provider);
+        populating = true;
+        SetProtocols(preset.Protocol);
+        if (preset.Base.Length != 0 && (endpoint.Text.Trim().Length == 0 ||
+            ModelCapabilities.Recognize(endpoint.Text.Trim()).Suggestion != preset.Name))
+        {
+            endpoint.Text = preset.Base;
+            model.Text = preset.Name == PrivateModelSettings.DeepSeek ? "deepseek-flash" : "";
+            key.Clear();
+        }
+        populating = false;
+        UpdateAddress("default", "default");
+    }
+
+    private void UpdateAddress(string mode = null, string strength = null)
+    {
+        var draft = ReadFields();
+        try { resolved.Text = ModelCapabilities.Resolve(draft).AbsoluteUri; }
+        catch (ModelReplyException error) { resolved.Text = error.Message; }
+        tips.SetToolTip(resolved, resolved.Text);
+        modelHint.Text = ModelCapabilities.Preset(Provider).Hint;
+        tips.SetToolTip(modelHint, modelHint.Text);
+        UpdateThinking(mode, strength);
+        UpdateKeyState();
+    }
+
+    private void UpdateThinking(string mode = null, string strength = null)
     {
         if (populating) return;
-        if (thinking.SelectedIndex < 0) thinking.SelectedIndex = 0;
-        bool supported = ModelCapabilities.SupportsThinking(new PrivateModelSettings {
-            Endpoint = endpoint.Text.Trim(), Provider = (string)provider.SelectedItem, Model = model.Text.Trim()
-        });
-        thinking.Enabled = supported;
-        thinkingNote.Text = supported ? "按 DeepSeek 文档映射" : "当前接口或模型的思考参数未确认";
-        if (!supported) thinking.SelectedIndex = 0;
-        effort.Enabled = supported && thinking.SelectedIndex == 1;
-        if (!effort.Enabled) effort.SelectedIndex = 0;
+        var options = ModelCapabilities.Thinking(ReadFields());
+        mode = mode ?? Selected(thinking);
+        strength = strength ?? Selected(effort);
+        var modes = new System.Collections.Generic.List<Option> { new Option("default", "模型默认") };
+        if (options.On != null) modes.Add(new Option("enabled", "开启"));
+        if (options.Off != null) modes.Add(new Option("disabled", "关闭"));
+        populating = true;
+        Options(thinking, modes.ToArray(), mode);
+        thinking.Enabled = modes.Count > 1;
+        var ability = options.Switch != null || options.Efforts.Length > 0;
+        thinkingNote.Text = !ability ? "当前接口或模型的思考参数未确认" :
+            !thinking.Enabled ? "此模型仅支持调整强度" : "按当前模型和协议的选项发送";
+        effort.Enabled = options.Efforts.Length > 0 && Selected(thinking) != "disabled" &&
+            (options.On == null || Selected(thinking) == "enabled");
+        var efforts = new[] { new Option("default", "模型默认强度") }.Concat(
+            effort.Enabled ? options.Efforts.Select(value => new Option(value, value)) : Enumerable.Empty<Option>());
+        Options(effort, efforts.ToArray(), strength);
+        populating = false;
     }
 
     private void UpdateKeyState()
@@ -198,17 +299,35 @@ internal sealed class ModelConfigForm : Form
         key.Enabled = !removeKey.Checked;
     }
 
+    private void UpdateProxyState()
+    {
+        if (populating) return;
+        var enabled = Network == ModelNetwork.Proxy;
+        proxy.Enabled = removeProxyAuth.Enabled = enabled;
+        proxyUser.Enabled = proxyPassword.Enabled = enabled && !removeProxyAuth.Checked;
+        var saved = editing != null && !String.IsNullOrEmpty(editing.Settings.ProxyUser) &&
+            ModelNetwork.SameProxy(editing.Settings.ProxyAddress, proxy.Text.Trim());
+        proxyState.Text = !enabled ? "仅影响当前模型配置。系统和 QQ 网络设置保持原样。" :
+            removeProxyAuth.Checked ? "保存时清除代理用户名和密码。" :
+            saved ? "已保存 ••••••••　留空保留同一代理的认证" : "可选代理认证。用户名和密码都会加密保存。";
+    }
+
     private PrivateModelSettings ReadFields()
     {
         var address = endpoint.Text.Trim();
         var apiKey = key.Text.Trim();
         if (apiKey.Length == 0 && editing != null && ModelCapabilities.SameOrigin(editing.Settings.Endpoint, address))
             apiKey = editing.Settings.ApiKey;
-        return new PrivateModelSettings { Provider = (string)provider.SelectedItem, Endpoint = address,
+        var draft = new PrivateModelSettings { Provider = Provider, Endpoint = address, Protocol = Protocol, Network = Network,
             Model = model.Text.Trim(), ApiKey = removeKey.Checked ? "" : apiKey, RoleName = roleName.Text.Trim(), RolePrompt = role.Text.Trim(),
-            TimeoutSeconds = (int)timeout.Value, ContextTurns = (int)turns.Value,
-            ThinkingMode = new[] { "default", "enabled", "disabled" }[thinking.SelectedIndex],
-            ThinkingEffort = new[] { "default", "low", "high", "max" }[effort.SelectedIndex] };
+            TimeoutSeconds = (int)timeout.Value, ContextTurns = (int)turns.Value, OutputTokens = (int)output.Value,
+            ThinkingMode = Selected(thinking), ThinkingEffort = Selected(effort), ProxyAddress = proxy.Text.Trim() };
+        if (removeProxyAuth.Checked) return draft;
+        var prior = editing != null && ModelNetwork.SameProxy(editing.Settings.ProxyAddress, draft.ProxyAddress) ? editing.Settings : null;
+        draft.ProxyUser = String.IsNullOrEmpty(proxyUser.Text) && prior != null ? prior.ProxyUser : proxyUser.Text;
+        var preservePassword = prior != null && draft.ProxyUser == prior.ProxyUser && String.IsNullOrEmpty(proxyPassword.Text);
+        draft.ProxyPassword = preservePassword ? prior.ProxyPassword : proxyPassword.Text;
+        return draft;
     }
 
     private void StartNew()
@@ -251,7 +370,7 @@ internal sealed class ModelConfigForm : Form
     private void Duplicate()
     {
         if (editing == null) { result.Text = "请选择要复制的已保存配置。"; return; }
-        var answer = MessageBox.Show(this, "复制选中的已保存配置。是否一并复制已经加密保存的密钥？",
+        var answer = MessageBox.Show(this, "复制选中的已保存配置。是否一并复制已加密保存的 API 密钥和代理认证？",
             "复制配置", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
         if (answer == DialogResult.Cancel) return;
         var baseName = editing.Name.Substring(0, Math.Min(editing.Name.Length, 48)) + " 副本";
@@ -264,7 +383,7 @@ internal sealed class ModelConfigForm : Form
             catalog.Put(copy);
             ModelCatalogFile.Save(folder, catalog);
             RefreshList(copy);
-            result.Text = answer == DialogResult.Yes ? "已复制并加密保存密钥。" : "已复制配置，副本密钥为空。";
+            result.Text = answer == DialogResult.Yes ? "已复制并加密保存凭据。" : "已复制配置，副本的密钥和代理认证为空。";
         }
         catch (Exception error) { ReloadCatalogAfterError(error); }
     }
@@ -296,10 +415,17 @@ internal sealed class ModelConfigForm : Form
     {
         var found = ModelCapabilities.Recognize(endpoint.Text.Trim());
         result.Text = found.Message;
-        if (found.Suggestion != null && found.Suggestion != (string)provider.SelectedItem &&
-            MessageBox.Show(this, found.Message + "\r\n采用此建议作为当前编辑中的接口类型？",
+        if (found.Suggestion != null && (found.Suggestion != Provider || found.Protocol != null && found.Protocol != Protocol) &&
+            MessageBox.Show(this, found.Message + "\r\n在编辑区采用建议？API 地址保持原样。",
                 "识别服务商", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
-            provider.SelectedItem = found.Suggestion;
+        {
+            var previousProtocol = Protocol;
+            populating = true;
+            provider.SelectedItem = ModelCapabilities.Preset(found.Suggestion);
+            SetProtocols(found.Protocol ?? previousProtocol);
+            populating = false;
+            UpdateAddress();
+        }
     }
 
     private void FillExample()
@@ -312,15 +438,27 @@ internal sealed class ModelConfigForm : Form
         result.Text = "已填入可编辑示例。保存后对下次启动生效。可主动清空聊天上下文。";
     }
 
-    private async Task Check(bool completion)
+    private async Task Check(string operation)
     {
+        bool completion = operation == "answer";
         PrivateModelSettings draft;
         Uri destination;
-        try { draft = ReadFields(); destination = draft.Validate(); }
+        try
+        {
+            draft = ReadFields();
+            destination = draft.Validate(true, completion);
+            if (operation == "list" || !completion && draft.Provider != PrivateModelSettings.DeepSeek)
+            {
+                destination = ModelCapabilities.ModelsAddress(destination, draft.Provider);
+                if (destination == null) throw new ModelReplyException("models-unsupported",
+                    "当前地址的官方列表暂不可用，请手工填模型 ID。已配置型号可单独测试真实回答。");
+            }
+        }
         catch (Exception error) { result.Text = DisplayError(error); return; }
         var purpose = completion ? "将发送固定测试句并请求生成一个回答，可能计费。" :
             "将向同一服务地址查询鉴权或模型列表，无生成请求。";
-        if (MessageBox.Show(this, purpose + "\r\n目标服务「" + destination.Authority + "」，仅向此服务发送当前选用的密钥。",
+        if (MessageBox.Show(this, purpose + "\r\n目标服务「" + destination.Authority + "」，网络方式「" +
+            ModelNetwork.Label(draft.Network) + "」。模型密钥仅用于该服务地址。",
             "模型检查", MessageBoxButtons.OKCancel, MessageBoxIcon.Information, MessageBoxDefaultButton.Button2) != DialogResult.OK) return;
         using (var cancellation = new CancellationTokenSource())
         {
@@ -329,10 +467,16 @@ internal sealed class ModelConfigForm : Form
             result.Text = "正在检查已配置地址…";
             try
             {
-                using (var reply = new DeepSeekPrivateReply(draft, () => new PrivateModelTurn[0], log))
+                using (var reply = new HttpPrivateReply(draft, () => new PrivateModelTurn[0], log, listOnly: !completion))
                 {
                     string kind;
                     if (completion) { await reply.TestAsync(cancellation.Token); kind = "completion"; }
+                    else if (operation == "list")
+                    {
+                        var ids = await reply.ListAsync(cancellation.Token);
+                        if (!IsDisposed) ChooseModel(ids);
+                        return;
+                    }
                     else kind = await reply.ProbeAsync(cancellation.Token);
                     if (!IsDisposed) RecordProbe(draft, kind, ProbeDescription(kind));
                 }
@@ -340,6 +484,26 @@ internal sealed class ModelConfigForm : Form
             catch (OperationCanceledException) { if (!IsDisposed) result.Text = "模型检查已取消。"; }
             catch (Exception error) { if (!IsDisposed) RecordProbe(draft, "failed", "模型检查未通过 · " + DisplayError(error)); }
             finally { active = null; if (!IsDisposed) SetBusy(false); }
+        }
+    }
+
+    private void ChooseModel(string[] ids)
+    {
+        result.Text = ids.Length == 0 ? "列表为空，仍可手工填入模型 ID。" :
+            "读取到 " + ids.Length + " 个模型。列表不代表账号可生成，可手工填写或单独测试。";
+        if (ids.Length == 0) return;
+        using (var dialog = new Form { Text = "选择返回的模型 ID", StartPosition = FormStartPosition.CenterParent,
+            ClientSize = new Size(495, 335), MinimizeBox = false, MaximizeBox = false })
+        using (var choices = new ListBox { Dock = DockStyle.Fill, HorizontalScrollbar = true })
+        {
+            var use = new Button { Text = "填入所选模型", Dock = DockStyle.Bottom, DialogResult = DialogResult.OK, Enabled = false };
+            choices.Items.AddRange(ids);
+            choices.SelectedIndexChanged += (s, e) => use.Enabled = choices.SelectedItem != null;
+            dialog.Controls.Add(choices);
+            dialog.Controls.Add(use);
+            dialog.AcceptButton = use;
+            if (dialog.ShowDialog(this) == DialogResult.OK && choices.SelectedItem != null)
+                model.Text = (string)choices.SelectedItem;
         }
     }
 
@@ -357,7 +521,9 @@ internal sealed class ModelConfigForm : Form
     {
         return a.Provider == b.Provider && a.Endpoint == b.Endpoint && a.Model == b.Model && a.ApiKey == b.ApiKey &&
             a.ThinkingMode == b.ThinkingMode && a.ThinkingEffort == b.ThinkingEffort && a.RoleName == b.RoleName &&
-            a.RolePrompt == b.RolePrompt && a.TimeoutSeconds == b.TimeoutSeconds && a.ContextTurns == b.ContextTurns;
+            a.RolePrompt == b.RolePrompt && a.TimeoutSeconds == b.TimeoutSeconds && a.ContextTurns == b.ContextTurns &&
+            a.Protocol == b.Protocol && a.OutputTokens == b.OutputTokens && a.Network == b.Network &&
+            a.ProxyAddress == b.ProxyAddress && a.ProxyUser == b.ProxyUser && a.ProxyPassword == b.ProxyPassword;
     }
 
     private static string ProbeDescription(string kind)

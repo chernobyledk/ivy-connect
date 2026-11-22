@@ -12,7 +12,11 @@ public sealed class PrivateModelProfile
     internal PrivateModelProfile CopyAs(string name, bool includeKey)
     {
         var cloned = Settings.Copy();
-        if (!includeKey) cloned.ApiKey = "";
+        if (!includeKey)
+        {
+            cloned.ApiKey = "";
+            cloned.ProxyUser = cloned.ProxyPassword = "";
+        }
         return New(name, cloned);
     }
 

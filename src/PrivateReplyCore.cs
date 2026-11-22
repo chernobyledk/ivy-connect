@@ -107,6 +107,8 @@ internal sealed class PrivateReplyCore
     private readonly Action<string> progress;
     private readonly string bindingVersion;
     private readonly Stopwatch sessionClock = Stopwatch.StartNew();
+    private long lastScanNotice = -30000;
+    internal int VisibleRows { get; private set; }
     internal bool RecoveryBlocked { get; private set; }
     internal bool BindingInvalidated { get; private set; }
     internal int OwnIgnored { get; private set; }
@@ -143,11 +145,15 @@ internal sealed class PrivateReplyCore
         Wait(350);
         var current = wire.Read();
         timeline.Seed(first, current);
+        VisibleRows = current.Length;
         var display = PrivateStore.Observe(current);
         var previous = store.State.Snapshot;
         var positionMatches = previous.Intersect(display).Count();
         log("baseline reset rows=" + display.Length + " priorRows=" + previous.Length +
-            " exact-runtime-evidence-overlap=" + positionMatches + " offline-backfill=no");
+            " exact-runtime-evidence-overlap=" + positionMatches + " offline-backfill=no" +
+            " incoming=" + current.Count(row => row.Own == false) +
+            " outgoing=" + current.Count(row => row.Own == true) +
+            " unknown=" + current.Count(row => !row.Own.HasValue));
         foreach (var item in store.State.Events)
         {
             if (PrivateStore.IsPending(item))
@@ -187,6 +193,7 @@ internal sealed class PrivateReplyCore
     private void ConfirmLocal(PrivateEvent item, string detail)
     {
         store.ConfirmLocal(item, detail);
+        progress("已确认本地回复气泡 · " + ShortId(item));
         log("local-id=" + item.LocalId + " phase=LocalConfirmed detail=" + detail);
         Timing(item, "local-confirm");
     }
@@ -213,10 +220,16 @@ internal sealed class PrivateReplyCore
         RequireRoute(current.BotQq, current.PeerQq);
         var scanning = sessionClock.ElapsedMilliseconds;
         var rows = wire.Read();
+        VisibleRows = rows.Length;
         var readFinished = sessionClock.ElapsedMilliseconds;
         ReplyRow[] added;
         try { added = timeline.Advance(rows); }
-        catch (InvalidOperationException) { throw new PrivateRouteLostException("消息列表连续性已丢失，请重新核验原私聊"); }
+        catch (InvalidOperationException)
+        {
+            log("receive timeline-discontinuity visible=" + rows.Length + " scan-ms=" + (readFinished - scanning));
+            throw new PrivateRouteLostException("已读到 QQ 消息区，但列表连续性中断。请重新核验原私聊。");
+        }
+        int accepted = 0;
         foreach (var row in added)
         {
             if (row.Own == true) { OwnIgnored++; continue; }
@@ -232,6 +245,17 @@ internal sealed class PrivateReplyCore
             store.State.Events = store.State.Events.Concat(new[] { item }).ToArray();
             Change(item, PrivatePhase.Observed, "uia-new-incoming anchor=" + MessageSnapshot.Hash(row.Anchor));
             Change(item, PrivatePhase.Queued, "fixed-route");
+            accepted++;
+            progress("已读到来信 · " + ShortId(item));
+        }
+        if (added.Length != 0 || readFinished - lastScanNotice >= 30000)
+        {
+            lastScanNotice = readFinished;
+            var own = added.Count(row => row.Own == true);
+            var unknown = added.Count(row => !row.Own.HasValue);
+            log("receive scanned visible=" + rows.Length + " appended=" + added.Length + " own=" + own +
+                " direction-unknown=" + unknown + " text-or-scope-filtered=" + (added.Length - own - unknown - accepted) +
+                " accepted=" + accepted + " scan-ms=" + (readFinished - scanning));
         }
         var evidence = PrivateStore.Observe(rows);
         if (!evidence.SequenceEqual(store.State.Snapshot)) SaveSnapshot(evidence);
@@ -267,6 +291,8 @@ internal sealed class PrivateReplyCore
     {
         log("timing id=" + item.LocalId + " stage=" + stage + " mono-ms=" + sessionClock.ElapsedMilliseconds);
     }
+
+    private static string ShortId(PrivateEvent item) { return item.LocalId.Substring(0, Math.Min(8, item.LocalId.Length)); }
 
     private ReplyDraft Generate(PrivateEvent item, int revision)
     {
@@ -313,6 +339,7 @@ internal sealed class PrivateReplyCore
             if (item.Phase == PrivatePhase.Queued)
             {
                 generationStarted = true;
+                progress((provider is HttpPrivateReply ? "正在请求模型 · " : "正在生成固定回复 · ") + ShortId(item));
                 Timing(item, "provider-start");
                 var draft = Generate(item, revision);
                 Timing(item, "provider-end");
@@ -326,6 +353,7 @@ internal sealed class PrivateReplyCore
                 Change(item, PrivatePhase.Generated, "reply-provider");
             }
             ReplyRow[] before = null;
+            progress("准备写入及复核发送目标 · " + ShortId(item));
             Change(item, PrivatePhase.Preparing, "before-editor-write");
             var checkedWire = wire as ICheckedPrivateTransport;
             Action<Action, Action> submitChecked = (prepare, submit) => control.Commit(revision,
@@ -348,6 +376,7 @@ internal sealed class PrivateReplyCore
                 wire.RequireReady();
                 wire.Submit(item.Reply, () => before = Verify(item, revision, true), submit => submitChecked(() => { }, submit));
             }
+            progress("已提交，等待核验本地回复气泡 · " + ShortId(item));
             string reason;
             if (!ReceiptReview.Find(store, wire, item, control.Token, confirmationMilliseconds, progress, out reason))
                 throw new PrivateRouteLostException(reason);

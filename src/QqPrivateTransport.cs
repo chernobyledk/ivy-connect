@@ -16,6 +16,7 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
     private readonly Action guard;
     private readonly Action<string> log;
     private readonly Mutex windowLease;
+    private readonly VerifiedChatContinuity continuity = new VerifiedChatContinuity();
 
     internal static string EpochOf(Target target)
     {
@@ -74,9 +75,16 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
     private ReplyRow[] BoundRows(Controls ui)
     {
         var rows = ui.ReplyRows();
-        if (String.IsNullOrEmpty(proof.ConversationProof) && (String.IsNullOrEmpty(proof.ChallengeAnchor) ||
-            rows.Count(row => row.Own == false && MessageSnapshot.Hash(row.Anchor) == proof.ChallengeAnchor) != 1))
-            throw new PrivateRouteLostException("当前消息列表未找到唯一的原会话入站核验锚点，请重新核验");
+        if (String.IsNullOrEmpty(proof.ConversationProof))
+        {
+            bool continued;
+            if (!continuity.Check(proof.ChallengeAnchor, ui.HistoryLocator(), rows, out continued))
+            {
+                log("receive stopped: selected-route proof unavailable and challenge/continuous history could not be verified; rows=" + rows.Length);
+                throw new PrivateRouteLostException("当前不能通过原验证码气泡或连续消息复核会话，请重新核验");
+            }
+            if (continued) log("receive verified rolling history: original inbound challenge scrolled out; exact ordered directional overlap");
+        }
         return rows;
     }
 
@@ -344,5 +352,62 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
                 avatar, fields["anchor"], ui.SelectedConversationProof());
         }
         finally { Array.Clear(clear, 0, clear.Length); }
+    }
+}
+
+// Keeps proof only for one live transport. A process restart or a gap always requires independent re-verification.
+// The caller separately checks the current window epoch, the login avatar and the contact header before using this.
+internal sealed class VerifiedChatContinuity
+{
+    private string history;
+    private ReplyRow[] last;
+    private bool walking;
+
+    private static bool SameRow(ReplyRow a, ReplyRow b)
+    { return a.Key == b.Key && a.Digest == b.Digest && a.Own == b.Own; }
+
+    internal bool Check(string challenge, string list, ReplyRow[] current, out bool newlyContinued)
+    {
+        newlyContinued = false;
+        if (String.IsNullOrEmpty(challenge)) return false;
+        int hits = current.Count(row => row.Own == false && MessageSnapshot.Hash(row.Anchor) == challenge);
+        if (hits == 1)
+        {
+            history = list;
+            last = current;
+            walking = false;
+            return true;
+        }
+        if (hits != 0 || !HasOverlap(list, current))
+        {
+            history = null;
+            last = null;
+            walking = false;
+            return false;
+        }
+        last = current;
+        newlyContinued = !walking;
+        walking = true;
+        return true;
+    }
+
+    private bool HasOverlap(string list, ReplyRow[] current)
+    {
+        if (String.IsNullOrEmpty(list) || list != history || last == null || last.Length < 3 ||
+            current.Select(row => row.Key).Distinct().Count() != current.Length ||
+            last.Select(row => row.Key).Distinct().Count() != last.Length) return false;
+        int tail = Array.FindIndex(current, row => SameRow(row, last[last.Length - 1]));
+        int count = Math.Min(tail + 1, last.Length);
+        if (count < 3) return false;
+        bool incoming = false, outgoing = false;
+        for (int offset = 0; offset < count; offset++)
+        {
+            var row = current[tail - offset];
+            if (!SameRow(row, last[last.Length - 1 - offset])) return false;
+            if (String.IsNullOrWhiteSpace(row.Text) || !row.Own.HasValue) continue;
+            if (row.Own.Value) outgoing = true;
+            else incoming = true;
+        }
+        return incoming && outgoing;
     }
 }
