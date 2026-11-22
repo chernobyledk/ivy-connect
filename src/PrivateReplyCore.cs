@@ -213,7 +213,8 @@ internal sealed class PrivateReplyCore
         foreach (var row in added)
         {
             if (row.Own == true) { OwnIgnored++; continue; }
-            if (row.Own != false || row.Segments != 1 || String.IsNullOrWhiteSpace(row.RawText) || !permitted(row)) continue;
+            if (row.Own != false || row.Segments != 1 || String.IsNullOrWhiteSpace(row.RawText) ||
+                store.IsEnrollmentCode(row.RawText) || !permitted(row)) continue;
             var proof = store.State.Binding;
             var item = new PrivateEvent {
                 LocalId = Guid.NewGuid().ToString("N"), BotQq = proof.BotQq, PeerQq = proof.PeerQq,

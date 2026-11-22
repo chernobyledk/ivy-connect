@@ -53,7 +53,7 @@ internal static partial class Program
                     catch (AbandonedMutexException) { entered = true; }
                     if (!entered)
                     {
-                        MessageBox.Show("v0.3.1 控制窗已打开。请使用现有窗口或系统托盘中的控制窗。", "QQ 独立自动回复");
+                        MessageBox.Show("自动回复控制窗已打开。请使用现有窗口或系统托盘中的控制窗。", "QQ 独立自动回复");
                         return 2;
                     }
                     try { Application.Run(new PrivateCoreForm(PrivateProfile.Folder(

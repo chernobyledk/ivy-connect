@@ -51,6 +51,7 @@ internal static partial class Native
     [DllImport("user32.dll")] private static extern bool GetGUIThreadInfo(uint thread, ref ThreadInfo info);
     [DllImport("user32.dll")] private static extern bool IsChild(IntPtr parent, IntPtr child);
     [DllImport("user32.dll")] internal static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] private static extern int WindowStyle(IntPtr hwnd, int index);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hwnd, StringBuilder b, int n);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hwnd, StringBuilder b, int n);
     [DllImport("user32.dll")] private static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
@@ -101,6 +102,7 @@ internal static partial class Native
             if (window == overlay) return true;
         return false;
     }
+    internal static bool IsTopmost(IntPtr hwnd) { return (WindowStyle(hwnd, -20) & 8) != 0; }
     internal static string ForegroundLabel(IntPtr target)
     {
         var hwnd = GetForegroundWindow();

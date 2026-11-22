@@ -98,8 +98,8 @@ internal sealed class PrivateLiveCheck : Form
                 }
                 return;
             }
-            await PrepareEditor(Target.FromKnownHandle(Int64.Parse(s[2])), s[3], s[4], "peer");
-            await PrepareEditor(target, proof.PeerDisplay, proof.HeaderProof, "bot");
+            await PrepareEditor(Target.FromKnownHandle(Int64.Parse(s[2])), s[3], s[4], "peer", control.Token, Log);
+            await PrepareEditor(target, proof.PeerDisplay, proof.HeaderProof, "bot", control.Token, Log);
             if (s[7] == "send-side" || s[7] == "send-model-real")
             {
                 await Task.Run(() => QqConnection.VerifyUnique(proof, control.Token.ThrowIfCancellationRequested, Log), control.Token);
@@ -119,10 +119,10 @@ internal sealed class PrivateLiveCheck : Form
             if (x + width > work.Right) throw new InvalidOperationException("目标旁边没有专用便笺空间");
             Bounds = new Rectangle(x, work.Top + 215, width, 64);
             if (Native.GetForegroundWindow() != Handle) Activate(); // test-owned control, before measurement
-            using (var cover = new Cover())
+            using (var cover = new PictureCoverController(output, Log))
             using (var pad = new TypingPad(new Rectangle(x, work.Top + 20, width, 175), automaticMarker: s[6]))
             {
-                cover.CoverRect(outer);
+                cover.Show(target);
                 for (int i = 0; i < 60 && pad.Hwnd == IntPtr.Zero; i++) await Task.Delay(100, control.Token);
                 var padWindow = pad.Hwnd;
                 if (padWindow == IntPtr.Zero) throw new InvalidOperationException("专用便笺未启动");
@@ -130,7 +130,9 @@ internal sealed class PrivateLiveCheck : Form
                 for (int i = 0; i < 60 &&
                     (Native.GetForegroundWindow() != padWindow || !Native.HasChildFocus(padWindow) || pad.AutomaticSteps == 0); i++)
                     await Task.Delay(100, control.Token);
-                var coverWindow = cover.Handle;
+                var coverWindow = cover.Window;
+                if (coverWindow == IntPtr.Zero || Native.IsTopmost(coverWindow))
+                    throw new InvalidOperationException("图片遮罩未建立为普通非置顶窗口");
                 await Task.Delay(900, control.Token);
                 using (var trace = new ForegroundTrace())
                 {
@@ -193,47 +195,47 @@ internal sealed class PrivateLiveCheck : Form
         }
     }
 
-    private async Task PrepareEditor(Target target, string display, string header, string endpoint)
+    internal static async Task PrepareEditor(Target target, string display, string header, string endpoint, CancellationToken token, Action<string> log)
     {
         var available = await Task.Run(() => {
             for (int attempt = 0; ; attempt++)
             {
-                control.Token.ThrowIfCancellationRequested();
+                token.ThrowIfCancellationRequested();
                 try
                 {
                     var b = new Binding(target, false, true);
                     var ui = b.RequireMatch();
                     if (b.HeaderProof != header || ui.HeaderIdentity() != display || !ui.EmptyDraft() || ui.HasVisibleConnectionWarning())
                         throw new InvalidOperationException("测试准备阶段无法核验 " + endpoint + " 会话及空草稿");
-                    return MsaaProbe.FindMappedEditor(target, ui, Log) != null;
+                    return MsaaProbe.FindMappedEditor(target, ui, log) != null;
                 }
                 catch (ElementNotAvailableException)
                 {
                     if (attempt == 2) throw;
-                    Log("setup " + endpoint + " transient UIA node: retry read only");
+                    log("setup " + endpoint + " transient UIA node: retry read only");
                     Thread.Sleep(250);
                 }
                 catch (System.Runtime.InteropServices.COMException ex)
                 {
                     if (attempt == 2) throw;
-                    Log("setup " + endpoint + " COM read retry only hr=0x" + ex.HResult.ToString("X8"));
+                    log("setup " + endpoint + " COM read retry only hr=0x" + ex.HResult.ToString("X8"));
                     Thread.Sleep(250);
                 }
             }
-        }, control.Token);
+        }, token);
         if (available)
         {
-            Log("setup " + endpoint + " editor usable without activation");
+            log("setup " + endpoint + " editor usable without activation");
             return;
         }
         if (Native.GetForegroundWindow() != target.Hwnd)
         {
-            Log("setup " + endpoint + " activation-call QQ result=" + Native.SetForegroundWindow(target.Hwnd));
-            for (int i = 0; i < 12 && Native.GetForegroundWindow() != target.Hwnd; i++) await Task.Delay(100, control.Token);
+            log("setup " + endpoint + " activation-call QQ result=" + Native.SetForegroundWindow(target.Hwnd));
+            for (int i = 0; i < 12 && Native.GetForegroundWindow() != target.Hwnd; i++) await Task.Delay(100, token);
         }
         if (Native.GetForegroundWindow() != target.Hwnd)
             throw new InvalidOperationException("测试准备阶段 QQ 未成为前台 " + endpoint);
-        await Task.Delay(850, control.Token);
+        await Task.Delay(850, token);
         await Task.Run(() => {
             for (int retry = 0; ; retry++)
             {
@@ -248,21 +250,21 @@ internal sealed class PrivateLiveCheck : Form
                     if (bounds.IsEmpty) throw new InvalidOperationException("无法复核空编辑区边界");
                     Native.ClickVerifiedPoint(target.Hwnd, (int)(bounds.X + bounds.Width / 2),
                         (int)(bounds.Y + bounds.Height / 2), false);
-                    Log("setup " + endpoint + " click on verified empty editor; before measurement");
+                    log("setup " + endpoint + " click on verified empty editor; before measurement");
                     Thread.Sleep(280);
                     ui = binding.RequireMatch();
-                    if (MsaaProbe.FindMappedEditor(target, ui, Log) != null) return;
-                    MsaaProbe.Describe(target, ui, Log);
+                    if (MsaaProbe.FindMappedEditor(target, ui, log) != null) return;
+                    MsaaProbe.Describe(target, ui, log);
                     throw new InvalidOperationException("测试准备后仍未匹配 " + endpoint + " 编辑对象");
                 }
                 catch (ElementNotAvailableException)
                 {
                     if (retry == 2) throw;
-                    Log("setup " + endpoint + " transient UIA element rebuilt");
+                    log("setup " + endpoint + " transient UIA element rebuilt");
                     Thread.Sleep(320);
                 }
             }
-        }, control.Token);
+        }, token);
     }
 
     private void Verify(string[] s, string output, bool restart, PrivateBindingProof proof, Target target, Action guard)

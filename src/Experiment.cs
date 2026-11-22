@@ -7,18 +7,59 @@ using System.Windows.Forms;
 
 internal sealed class Cover : Form
 {
-    internal Cover()
+    private Bitmap image;
+
+    internal Cover(bool experimentTopmost = true)
     {
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false;
         BackColor = Color.FromArgb(35, 92, 130);
-        TopMost = true;
+        DoubleBuffered = true;
+        TopMost = experimentTopmost;
     }
     protected override bool ShowWithoutActivation { get { return true; } }
     protected override CreateParams CreateParams
     {
         get { var p = base.CreateParams; p.ExStyle |= 0x08000000 | 0x80; return p; }
+    }
+    protected override void WndProc(ref Message message)
+    {
+        if (message.Msg == 0x21) { message.Result = new IntPtr(4); return; } // WM_MOUSEACTIVATE: MA_NOACTIVATEANDEAT
+        base.WndProc(ref message);
+    }
+
+    internal void UseImage(Bitmap next) { image = next; Invalidate(); }
+
+    internal static RectangleF FillRect(Size client, Size source)
+    {
+        var ratio = Math.Max((float)client.Width / source.Width, (float)client.Height / source.Height);
+        var width = source.Width * ratio;
+        var height = source.Height * ratio;
+        return new RectangleF((client.Width - width) / 2, (client.Height - height) / 2, width, height);
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        base.OnPaint(e);
+        if (image == null || ClientSize.Width == 0 || ClientSize.Height == 0) return;
+        e.Graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+        e.Graphics.DrawImage(image, FillRect(ClientSize, image.Size));
+    }
+
+    internal bool Follow(Target target)
+    {
+        if (!target.SameWindow() || !Native.Visible(target.Hwnd) || Native.IsIconic(target.Hwnd) || Native.IsTopmost(target.Hwnd))
+            return false;
+        var rect = Native.Bounds(target.Hwnd);
+        if (rect.Width <= 0 || rect.Height <= 0) return false;
+        if (!Visible) { Bounds = rect; Show(); }
+        var before = Native.GetWindow(target.Hwnd, 3); // window immediately above target in the Z order
+        var correctOrder = before == Handle;
+        if (correctOrder && Native.Bounds(Handle) == rect) return true;
+        if (!correctOrder && Native.IsTopmost(before)) before = IntPtr.Zero;
+        return Native.SetWindowPos(Handle, before, rect.X, rect.Y, rect.Width, rect.Height,
+            Native.NoActivate | Native.NoOwnerZOrder | (correctOrder ? Native.NoZOrder : 0));
     }
     internal void CoverRect(Rectangle rect)
     {

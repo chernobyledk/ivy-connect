@@ -43,6 +43,7 @@ public sealed class PrivateState
     public string[] Snapshot = new string[0];
     public string SnapshotEpoch;
     public PrivateModelTurn[] ModelTurns = new PrivateModelTurn[0];
+    public string[] EnrollmentCodeHashes = new string[0];
 }
 
 internal sealed class PrivateProfileBusyException : IOException
@@ -137,6 +138,19 @@ internal sealed class PrivateStore : IDisposable
     internal void ClearModelContext()
     {
         State.ModelTurns = new PrivateModelTurn[0];
+        Save();
+    }
+
+    internal bool IsEnrollmentCode(string value)
+    {
+        var text = (value ?? "").Trim();
+        return NumericChallenge.IsCode(text) && (State.EnrollmentCodeHashes ?? new string[0]).Contains(MessageSnapshot.Hash(text));
+    }
+
+    internal void ReserveEnrollmentCode(string code)
+    {
+        if (!NumericChallenge.IsCode(code) || IsEnrollmentCode(code)) throw new InvalidOperationException("该验证码已经使用");
+        State.EnrollmentCodeHashes = (State.EnrollmentCodeHashes ?? new string[0]).Concat(new[] { MessageSnapshot.Hash(code) }).ToArray();
         Save();
     }
 

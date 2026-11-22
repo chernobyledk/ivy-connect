@@ -228,6 +228,38 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
     internal static PrivateBindingProof Enroll(long hwnd, string bot, string peer, string botDisplay, string peerDisplay,
         string challenge, CancellationToken token, Action<string> log)
     {
+        return EnrollCore(hwnd, bot, peer, botDisplay, peerDisplay, token, log, baseline => {
+            if (baseline.Any(row => row.Text == MessageSnapshot.Normalize(challenge)))
+                throw new InvalidOperationException("验证编号已出现在历史中");
+            log("enrollment baseline established");
+            return additions => {
+                var hits = additions.Where(row => row.Text == MessageSnapshot.Normalize(challenge)).ToArray();
+                if (hits.Length == 0) return null;
+                if (hits.Length != 1 || hits[0].Own != false) throw new InvalidOperationException("来信核验编号不唯一或方向错误");
+                return hits[0];
+            };
+        }, () => { });
+    }
+
+    internal static PrivateBindingProof EnrollNumeric(long hwnd, string bot, string peer, string botDisplay, string peerDisplay,
+        PrivateStore store, CancellationToken token, Action<string> log, Action<NumericChallenge> opened, Action<int> failures)
+    {
+        NumericChallenge current = null;
+        return EnrollCore(hwnd, bot, peer, botDisplay, peerDisplay, token, log, baseline => {
+            var code = NumericChallenge.Generate(value => store.IsEnrollmentCode(value) ||
+                baseline.Any(row => (row.RawText ?? "").Trim() == value));
+            store.ReserveEnrollmentCode(code);
+            token.ThrowIfCancellationRequested();
+            current = new NumericChallenge(code);
+            log("numeric enrollment baseline established");
+            opened(current);
+            return additions => current.Match(additions, token, failures);
+        }, () => { if (current != null) current.Check(token); });
+    }
+
+    private static PrivateBindingProof EnrollCore(long hwnd, string bot, string peer, string botDisplay, string peerDisplay,
+        CancellationToken token, Action<string> log, Func<ReplyRow[], Func<ReplyRow[], ReplyRow>> begin, Action checkAttempt)
+    {
         CheckNumbers(bot, peer);
         var target = Target.FromKnownHandle(hwnd);
         if (!Native.Visible(target.Hwnd) || Native.IsIconic(target.Hwnd))
@@ -243,14 +275,14 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
         }, token.ThrowIfCancellationRequested, log);
         var timeline = new ReplyTimeline();
         var before = initial.Item2;
-        if (before.Any(row => row.Text == MessageSnapshot.Normalize(challenge)))
-            throw new InvalidOperationException("验证编号已出现在历史中");
         if (token.WaitHandle.WaitOne(350)) token.ThrowIfCancellationRequested();
-        timeline.Seed(before, ReadStable(() => binding.RequireMatch().ReplyRows(), token.ThrowIfCancellationRequested, log));
-        log("enrollment baseline established");
+        var currentRows = ReadStable(() => binding.RequireMatch().ReplyRows(), token.ThrowIfCancellationRequested, log);
+        timeline.Seed(before, currentRows);
+        var match = begin(currentRows);
         while (true)
         {
             if (token.WaitHandle.WaitOne(340)) token.ThrowIfCancellationRequested();
+            checkAttempt();
             if (!Native.Visible(target.Hwnd) || Native.IsIconic(target.Hwnd))
                 throw new InvalidOperationException("核验期间 QQ 窗口状态变化");
             var snapshot = ReadStable(() => {
@@ -260,10 +292,10 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
                     throw new InvalidOperationException("核验期间账号、会话、草稿或连接状态变化");
                 return ui.ReplyRows();
             }, token.ThrowIfCancellationRequested, log);
-            var hits = timeline.Advance(snapshot).Where(row => row.Text == MessageSnapshot.Normalize(challenge)).ToArray();
-            if (hits.Length == 0) continue;
-            if (hits.Length != 1 || hits[0].Own != false) throw new InvalidOperationException("来信核验编号不唯一或方向错误");
-            return Capture(target, binding, bot, peer, botDisplay, peerDisplay, initial.Item1, MessageSnapshot.Hash(hits[0].Anchor));
+            var hit = match(timeline.Advance(snapshot));
+            if (hit == null) continue;
+            checkAttempt();
+            return Capture(target, binding, bot, peer, botDisplay, peerDisplay, initial.Item1, MessageSnapshot.Hash(hit.Anchor));
         }
     }
 

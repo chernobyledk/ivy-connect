@@ -14,7 +14,7 @@ internal sealed class PrivateCoreForm : Form
     private readonly Label status = new Label { Dock = DockStyle.Fill, Padding = new Padding(8) };
     private readonly Label connectionState = new Label { Dock = DockStyle.Top, Height = 26, Padding = new Padding(8, 6, 0, 0) };
     private readonly Panel diagnostics = new Panel { Dock = DockStyle.Top, Height = 29, Visible = false };
-    private readonly CheckBox attested = new CheckBox { Text = "已从 QQ 资料卡核对两端号码，并打开此私聊", AutoSize = true };
+    private readonly CheckBox attested = new CheckBox { Text = "已从 QQ 资料卡核对双方号码，当前打开的是这个私聊", AutoSize = true };
     private readonly Button bind = new Button { Text = "核验并绑定", AutoSize = true };
     private readonly Button start = new Button { Text = "开始回复", AutoSize = true };
     private readonly Button pause = new Button { Text = "暂停", AutoSize = true };
@@ -27,8 +27,17 @@ internal sealed class PrivateCoreForm : Form
     private readonly Button showQq = new Button { Text = "显示 QQ", AutoSize = true };
     private readonly Button sideQq = new Button { Text = "侧边摆放", AutoSize = true };
     private readonly Button restoreQq = new Button { Text = "恢复原位置", AutoSize = true };
+    private readonly Button showCover = new Button { Text = "显示遮罩", AutoSize = true };
+    private readonly Button closeCover = new Button { Text = "关闭遮罩", AutoSize = true };
+    private readonly Button chooseCover = new Button { Text = "选择遮罩图片", AutoSize = true };
+    private readonly Button resetCover = new Button { Text = "恢复默认图片", AutoSize = true };
+    private readonly Label boundChat = new Label { Dock = DockStyle.Top, Height = 26, Padding = new Padding(8, 5, 0, 0) };
+    private readonly Label coverStatus = new Label { Dock = DockStyle.Bottom, Height = 25, Padding = new Padding(8, 4, 0, 0) };
+    private readonly BindingPromptPanel bindPrompt = new BindingPromptPanel();
+    private readonly PictureCoverController pictureCover;
+    private readonly Icon launcherIcon;
     private readonly QqPlacement placement = new QqPlacement();
-    private readonly NotifyIcon tray = new NotifyIcon { Icon = SystemIcons.Application, Text = "QQ 单私聊回复" };
+    private readonly NotifyIcon tray = new NotifyIcon { Text = "QQ 单私聊回复" };
     private readonly ComboBox mode = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 95 };
     private readonly object logGate = new object();
     private PrivateRunControl run;
@@ -36,23 +45,29 @@ internal sealed class PrivateCoreForm : Form
     private CancellationTokenSource discovery;
     private bool closePending;
     private bool connecting;
+    private bool regenerateEnrollment;
+    private bool restoreAfterStop;
     private QqCandidate selectedCandidate;
+    private PrivateBindingProof liveProof;
 
     internal PrivateCoreForm(string folder, Predicate<ReplyRow> acceptIncoming = null)
     {
         this.folder = folder;
         this.acceptIncoming = acceptIncoming ?? (_ => true);
         Text = "QQ 自动回复 · 单私聊 AI v" + Application.ProductVersion;
-        ClientSize = new Size(680, 466);
-        MinimumSize = new Size(620, 480);
+        launcherIcon = PresentationAssets.ReadIcon();
+        Icon = launcherIcon;
+        tray.Icon = launcherIcon;
+        ClientSize = new Size(690, 625);
+        MinimumSize = new Size(620, 650);
         StartPosition = FormStartPosition.CenterScreen;
         var grid = new TableLayoutPanel { Dock = DockStyle.Top, Height = 177, Padding = new Padding(8),
             ColumnCount = 2, RowCount = 5, GrowStyle = TableLayoutPanelGrowStyle.FixedSize };
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 60));
         for (int row = 0; row < 5; row++) grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
-        var labels = new[] { "机器人登录 QQ 号", "允许回复的对象 QQ 号", "机器人的登录显示名",
-            "私聊会话显示名" };
+        var labels = new[] { "自动回复账号 QQ 号（电脑端）", "聊天对象账号 QQ 号", "自动回复账号昵称",
+            "聊天对象昵称" };
         for (int i = 0; i < labels.Length; i++)
         {
             grid.Controls.Add(new Label { Text = labels[i], Anchor = AnchorStyles.Left, AutoSize = true }, 0, i);
@@ -73,13 +88,21 @@ internal sealed class PrivateCoreForm : Form
         buttons.Controls.AddRange(new Control[] { bind, mode, start, pause, stop, configure, clearContext });
         var location = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 54, Padding = new Padding(6, 4, 6, 0) };
         location.Controls.AddRange(new Control[] { findQq, pickQq, showQq, sideQq, restoreQq, advanced });
+        var masks = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 37, Padding = new Padding(6, 1, 6, 0) };
+        masks.Controls.AddRange(new Control[] { showCover, closeCover, chooseCover, resetCover });
         Controls.Add(status);
         Controls.Add(buttons);
         Controls.Add(location);
+        Controls.Add(masks);
+        Controls.Add(coverStatus);
+        Controls.Add(bindPrompt);
         Controls.Add(diagnostics);
         Controls.Add(grid);
+        Controls.Add(boundChat);
         Controls.Add(connectionState);
-        SetConnection("未连接", "请在机器人 QQ 打开目标私聊，然后点击「连接 QQ」或「开始回复」。");
+        pictureCover = new PictureCoverController(folder, text => coverStatus.Text = text);
+        DisplayBinding(null, false);
+        SetConnection("未连接", "请在自动回复账号中打开目标私聊，然后点击「连接 QQ」或「开始回复」。");
         try
         {
             PrivateProfile.Migrate(folder);
@@ -90,6 +113,7 @@ internal sealed class PrivateCoreForm : Form
                 {
                     var saved = new[] { p.BotQq, p.PeerQq, p.BotDisplay, p.PeerDisplay };
                     for (int i = 0; i < saved.Length; i++) fields[i].Text = saved[i];
+                    DisplayBinding(p, false);
                     status.Text = Summary(store, "已有核验记录。在机器人 QQ 打开原私聊后，点击「连接 QQ」或「开始回复」。");
                 }
             }
@@ -105,9 +129,16 @@ internal sealed class PrivateCoreForm : Form
         showQq.Click += async (s, e) => await ArrangeQq("show");
         sideQq.Click += async (s, e) => await ArrangeQq("side");
         restoreQq.Click += async (s, e) => await ArrangeQq("restore");
+        showCover.Click += async (s, e) => await ShowPictureCover();
+        closeCover.Click += (s, e) => pictureCover.Close();
+        chooseCover.Click += (s, e) => ChoosePicture();
+        resetCover.Click += (s, e) => ChangePicture(() => pictureCover.Reset());
         var menu = new ContextMenuStrip();
         menu.Items.Add("显示控制窗", null, (s, e) => ShowControl());
         menu.Items.Add("停止自动回复", null, (s, e) => RequestStop());
+        menu.Items.Add("显示 QQ", null, async (s, e) => await ArrangeQq("show"));
+        menu.Items.Add("关闭遮罩", null, (s, e) => pictureCover.Close());
+        menu.Items.Add("恢复原位置", null, async (s, e) => await ArrangeQq("restore"));
         tray.ContextMenuStrip = menu;
         tray.DoubleClick += (s, e) => ShowControl();
         Resize += (s, e) => {
@@ -116,6 +147,16 @@ internal sealed class PrivateCoreForm : Form
             Hide();
         };
         bind.Click += async (s, e) => await Enroll();
+        bindPrompt.Regenerate += async (s, e) => {
+            bindPrompt.End("正在生成新验证码…");
+            if (enrollment == null) await Enroll();
+            else { regenerateEnrollment = true; enrollment.Cancel(); }
+        };
+        bindPrompt.Cancel += (s, e) => {
+            regenerateEnrollment = false;
+            bindPrompt.End();
+            if (enrollment != null) enrollment.Cancel();
+        };
         configure.Click += (s, e) => { using (var dialog = new ModelConfigForm(ModelPath, Log)) dialog.ShowDialog(this); };
         clearContext.Click += (s, e) => {
             if (MessageBox.Show(this, "清空此私聊的模型上下文？收发状态和核验绑定会保留。", "清空上下文",
@@ -143,10 +184,12 @@ internal sealed class PrivateCoreForm : Form
             e.Cancel = true; closePending = true; RequestStop();
         };
         FormClosed += (s, e) => {
+            pictureCover.Dispose();
             try { if (placement.Restore()) Log("layout restored at close"); }
             catch (Exception ex) { Log("layout restore failed " + ModelConfigForm.DisplayError(ex)); }
             tray.Dispose();
             menu.Dispose();
+            launcherIcon.Dispose();
         };
         UpdateButtons();
     }
@@ -168,6 +211,12 @@ internal sealed class PrivateCoreForm : Form
     {
         connectionState.Text = "连接状态  " + state;
         status.Text = detail;
+    }
+
+    private void DisplayBinding(PrivateBindingProof proof, bool connected)
+    {
+        boundChat.Text = proof == null ? "已绑定会话 · 暂无" :
+            (connected ? "已绑定会话 · " : "已保存会话（待连接复核） · ") + proof.PeerDisplay + "（" + proof.PeerQq + "）";
     }
 
     private void ReportConnection(QqConnectionResult result)
@@ -229,7 +278,11 @@ internal sealed class PrivateCoreForm : Form
                 }, pending.Token);
                 pending.Token.ThrowIfCancellationRequested();
                 ReportConnection(result);
-                if (result.Binding != null) fields[4].Text = result.Binding.Window.ToString();
+                if (result.Binding != null)
+                {
+                    fields[4].Text = result.Binding.Window.ToString();
+                    DisplayBinding(result.Binding, true);
+                }
                 return result.Binding;
             }
             catch (OperationCanceledException) { SetConnection("未连接", "连接检查已取消。"); }
@@ -278,6 +331,22 @@ internal sealed class PrivateCoreForm : Form
 
     private async Task ArrangeQq(string command)
     {
+        if (command == "show") pictureCover.Close();
+        if (run != null)
+        {
+            if (command == "show")
+            {
+                try { QqPlacement.Show(QqConnection.Pinned(liveProof)); }
+                catch (Exception ex) { coverStatus.Text = ModelConfigForm.DisplayError(ex); }
+            }
+            else if (command == "restore")
+            {
+                restoreAfterStop = true;
+                RequestStop();
+            }
+            return;
+        }
+        if (connecting || enrollment != null) return;
         connecting = true;
         UpdateButtons();
         try
@@ -306,6 +375,28 @@ internal sealed class PrivateCoreForm : Form
         finally { connecting = false; Finished(); }
     }
 
+    private async Task ShowPictureCover()
+    {
+        try
+        {
+            var proof = run != null ? liveProof : await LocateQq();
+            if (proof != null && !IsDisposed && !closePending) pictureCover.Show(QqConnection.Pinned(proof));
+        }
+        catch (Exception ex) { coverStatus.Text = "遮罩未打开 · " + ModelConfigForm.DisplayError(ex); }
+    }
+
+    private void ChoosePicture()
+    {
+        using (var picker = new OpenFileDialog { Title = "选择遮罩图片", Filter = "图片|*.png;*.jpg;*.jpeg;*.bmp;*.gif|所有文件|*.*" })
+            if (picker.ShowDialog(this) == DialogResult.OK) ChangePicture(() => pictureCover.UseCustom(picker.FileName));
+    }
+
+    private void ChangePicture(Action change)
+    {
+        try { change(); }
+        catch (Exception) { coverStatus.Text = "图片无法读取或保存，保留原遮罩设置。"; }
+    }
+
     private static string Summary(PrivateStore store, string head)
     {
         var events = store.State.Events;
@@ -319,13 +410,19 @@ internal sealed class PrivateCoreForm : Form
         var idle = run == null && enrollment == null && !connecting;
         bind.Enabled = start.Enabled = attested.Enabled = configure.Enabled = clearContext.Enabled = mode.Enabled = idle;
         foreach (var field in fields) field.Enabled = idle;
-        findQq.Enabled = pickQq.Enabled = showQq.Enabled = sideQq.Enabled = restoreQq.Enabled = idle;
+        findQq.Enabled = pickQq.Enabled = sideQq.Enabled = idle;
+        showQq.Enabled = restoreQq.Enabled = showCover.Enabled = !connecting && enrollment == null;
         pause.Enabled = run != null && !run.Token.IsCancellationRequested;
         stop.Enabled = !idle;
     }
     private void RequestStop()
     {
-        if (enrollment != null) enrollment.Cancel();
+        if (enrollment != null)
+        {
+            regenerateEnrollment = false;
+            bindPrompt.End();
+            enrollment.Cancel();
+        }
         if (discovery != null) discovery.Cancel();
         if (run != null) run.Stop();
         status.Text = "正在停止，禁止新的提交。";
@@ -359,46 +456,75 @@ internal sealed class PrivateCoreForm : Form
             SetConnection("需要核验", "请核对两张 QQ 资料卡，再勾选确认。无需输入窗口句柄。");
             return;
         }
-        using (var pending = new CancellationTokenSource(TimeSpan.FromMinutes(3)))
+        do
         {
-            enrollment = pending;
-            SetConnection("核验中", "正在重新查找窗口并建立只读基线…");
-            UpdateButtons();
-            try
+            regenerateEnrollment = false;
+            using (var pending = new CancellationTokenSource())
             {
-                var verified = await Task.Run(() => {
-                    QqPrivateTransport.CheckNumbers(a[0], a[1]);
+                enrollment = pending;
+                SetConnection("核验中", "正在检查账号、窗口及会话，并建立本轮消息基线…");
+                UpdateButtons();
+                bool issued = false;
+                try
+                {
+                    var verified = await Task.Run(() => {
+                        QqPrivateTransport.CheckNumbers(a[0], a[1]);
+                        using (var store = new PrivateStore(folder))
+                        {
+                            var prior = store.State.Binding;
+                            if (prior != null && (prior.BotQq != a[0] || prior.PeerQq != a[1]))
+                                throw new PrivateRouteLostException("此状态目录只允许原核验账号对");
+                            var candidates = QqConnection.Collect(prior, pending.Token.ThrowIfCancellationRequested, Log)
+                                .Where(candidate => candidate.CanVerify(a[2], a[3]) && (chosen == null || candidate.Epoch == chosen.Epoch)).ToArray();
+                            if (candidates.Length != 1)
+                                throw new PrivateRouteLostException(candidates.Length > 1 ?
+                                    "请先使用「选择 QQ 窗口」，确认登录显示名与目标私聊" :
+                                    "没有找到符合资料卡核对条件且草稿为空的窗口，请打开自动回复账号的原私聊");
+                            var previousStamp = prior == null ? null : prior.RouteStamp();
+                            var next = QqPrivateTransport.EnrollNumeric(candidates[0].Window, a[0], a[1], a[2], a[3], store,
+                                pending.Token, Log, challenge => PostEnrollment(pending, () => {
+                                    issued = true;
+                                    bindPrompt.ShowCode(challenge, a[2], a[0], a[3], a[1]);
+                                    status.Text = "等待来自当前私聊的新验证码。";
+                                }), failures => PostEnrollment(pending, () => bindPrompt.RecordFailure(failures)));
+                            return Tuple.Create(next, previousStamp);
+                        }
+                    });
+                    pending.Token.ThrowIfCancellationRequested();
                     using (var store = new PrivateStore(folder))
                     {
                         var prior = store.State.Binding;
-                        if (prior != null && (prior.BotQq != a[0] || prior.PeerQq != a[1]))
-                            throw new InvalidOperationException("此状态目录只允许原核验账号对");
-                        var candidates = QqConnection.Collect(prior, pending.Token.ThrowIfCancellationRequested, Log)
-                            .Where(candidate => candidate.CanVerify(a[2], a[3]) && (chosen == null || candidate.Epoch == chosen.Epoch)).ToArray();
-                        if (candidates.Length != 1)
-                            throw new InvalidOperationException(candidates.Length > 1 ?
-                                "请先使用「选择 QQ 窗口」，确认登录显示名与目标私聊" :
-                                "当前未找到符合已核对显示名、私聊和空草稿条件的窗口。请打开机器人 QQ 主窗中的原私聊");
-                        var marker = "QQ验证绑定 " + Guid.NewGuid().ToString("N").Substring(0, 12).ToUpperInvariant();
-                        var next = QqPrivateTransport.Enroll(candidates[0].Window, a[0], a[1], a[2], a[3],
-                            marker, pending.Token, text => {
-                                Log(text);
-                                if (text == "enrollment baseline established") Report("请由已核对的对象发送 " + marker);
-                            });
-                        pending.Token.ThrowIfCancellationRequested();
-                        store.ReplaceBinding(next);
-                        Log("enrollment complete");
-                        return next;
+                        if ((prior == null ? null : prior.RouteStamp()) != verified.Item2)
+                            throw new PrivateRouteLostException("核验记录同时发生变化，请重新核验");
+                        store.ReplaceBinding(verified.Item1);
                     }
-                });
-                selectedCandidate = null;
-                fields[4].Text = verified.Window.ToString();
-                SetConnection("已就绪", "已保存核验绑定。点击「开始回复」后才会监听新消息。");
+                    Log("numeric enrollment complete");
+                    selectedCandidate = null;
+                    fields[4].Text = verified.Item1.Window.ToString();
+                    DisplayBinding(verified.Item1, true);
+                    bindPrompt.End();
+                    SetConnection("已就绪", "已保存核验绑定。点击「开始回复」后才会监听新消息。");
+                }
+                catch (OperationCanceledException)
+                {
+                    if (!regenerateEnrollment) { bindPrompt.End(); SetConnection("需要核验", "已取消本次核验。"); }
+                }
+                catch (Exception ex)
+                {
+                    bindPrompt.End(issued ? "请点击「重新生成」以重试。" : null);
+                    SetConnection("需要核验", "核验暂停。" + ModelConfigForm.DisplayError(ex));
+                }
+                finally { enrollment = null; }
             }
-            catch (OperationCanceledException) { SetConnection("需要核验", "核验已取消或超时。"); }
-            catch (Exception ex) { SetConnection("需要核验", "核验暂停。" + ModelConfigForm.DisplayError(ex)); }
-            finally { enrollment = null; Finished(); }
-        }
+        } while (regenerateEnrollment && !closePending);
+        Finished();
+    }
+
+    private void PostEnrollment(CancellationTokenSource attempt, Action update)
+    {
+        BeginInvoke(new Action(() => {
+            if (ReferenceEquals(enrollment, attempt) && !attempt.IsCancellationRequested) update();
+        }));
     }
 
     private async Task StartCore()
@@ -408,6 +534,7 @@ internal sealed class PrivateCoreForm : Form
         if (connected == null || closePending || IsDisposed) return;
         using (var active = new PrivateRunControl())
         {
+            liveProof = connected;
             run = active;
             pause.Text = "暂停";
             SetConnection("已就绪", "正在重新建立消息基线…");
@@ -415,7 +542,12 @@ internal sealed class PrivateCoreForm : Form
             try { SetConnection("已停止", await Task.Run(() => Watch(connected, useModel, active))); }
             catch (OperationCanceledException) { SetConnection("已停止", "请点击「开始回复」再次核验并启动。"); }
             catch (Exception ex) { SetConnection("未连接", "启动已停止。" + ModelConfigForm.DisplayError(ex)); }
-            finally { run = null; Finished(); }
+            finally { run = null; liveProof = null; Finished(); }
+        }
+        if (restoreAfterStop && !closePending && !IsDisposed)
+        {
+            restoreAfterStop = false;
+            await ArrangeQq("restore");
         }
     }
     private string Watch(PrivateBindingProof connected, bool useModel, PrivateRunControl active)
@@ -446,7 +578,11 @@ internal sealed class PrivateCoreForm : Form
                             var reason = ModelConfigForm.DisplayError(ex);
                             Log("halt " + reason);
                             if (core.RecoveryBlocked) return Summary(store, "提交结果待确认 · " + reason);
-                            if (core.BindingInvalidated) return Summary(store, "旧绑定的未提交任务已取消 · " + reason);
+                            if (core.BindingInvalidated)
+                            {
+                                BeginInvoke(new Action(() => pictureCover.Close()));
+                                return Summary(store, "旧绑定的未提交任务已取消 · " + reason);
+                            }
                             active.Pause();
                             Report(Summary(store, "已暂停 · " + reason), "暂停");
                         }
