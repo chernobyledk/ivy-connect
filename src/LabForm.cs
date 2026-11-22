@@ -47,6 +47,7 @@ internal sealed partial class LabForm : Form
         Add("前台收发基线", StartFrontBaseline);
         Add("第 2 轮对照矩阵", StartRound2);
         Add("尺寸与区域裁剪", StartRegionExperiment);
+        Add("连续验证小窗", () => { using (var panel = new ContinuousForm()) panel.ShowDialog(this); });
         tools.SetFlowBreak(tools.Controls[tools.Controls.Count - 1], true);
         tools.Controls.Add(new Label { Text = "宽 × 高", AutoSize = true, Margin = new Padding(4, 7, 4, 0) });
         tools.Controls.Add(width);

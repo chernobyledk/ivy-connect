@@ -230,6 +230,16 @@ internal sealed class Controls
         foreach (var child in RawChildren(row))
             foreach (var text in ReadBubble(child, depth - 1)) yield return text;
     }
+    internal ReplyRow[] ReplyRows()
+    {
+        if (History == null) throw new InvalidOperationException("消息列表未就绪");
+        return Bubbles.Skip(Math.Max(0, Bubbles.Count - 40)).Select(bubble => {
+            var id = bubble.GetRuntimeId();
+            if (id == null || id.Length == 0) throw new InvalidOperationException("消息气泡缺少 UIA 标识");
+            var parts = ReadBubble(bubble, 6).Take(200).ToArray();
+            return new ReplyRow(String.Join(".", id), parts);
+        }).ToArray();
+    }
     internal MessageSnapshot Messages(params string[] markers)
     {
         var uniqueMarkers = markers.Distinct().ToArray();

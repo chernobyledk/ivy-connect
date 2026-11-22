@@ -23,12 +23,20 @@ internal static partial class Program
             bool fullOcclusionWitness = arguments.Length == 2 && arguments[0] == "--round2-f-witness";
             bool awaitSelf = (arguments.Length == 2 || arguments.Length == 3 && arguments[2] == "--watch-f") &&
                 arguments[0] == "--await-verified-self";
-            bool typingPad = arguments.Length == 5 && arguments[0] == "--typing-pad";
+            bool typingPad = arguments.Length >= 5 && arguments.Length <= 7 && arguments[0] == "--typing-pad";
+            bool continuous = (arguments.Length == 1 || arguments.Length == 2) && arguments[0] == "--continuous";
             if (arguments.Length != 0 && !autoMatrix && !awaitSelf && !typingPad && !baseline && !round2 &&
-                !region && !finishRegion && !msaaWitness && !fullOcclusionWitness) return RunCommand(arguments);
+                !region && !finishRegion && !msaaWitness && !fullOcclusionWitness && !continuous) return RunCommand(arguments);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             if (typingPad) { TypingPad.Show(arguments); return 0; }
+            if (continuous)
+            {
+                var panel = new ContinuousForm();
+                if (arguments.Length == 2) panel.Shown += (s, e) => panel.EnrollPreviousSelf(Int64.Parse(arguments[1]));
+                Application.Run(panel);
+                return 0;
+            }
             var form = new LabForm();
             form.Shown += (s, e) => {
                 if (awaitSelf) form.CaptureAndRun(Int64.Parse(arguments[1]), arguments.Length == 3);
