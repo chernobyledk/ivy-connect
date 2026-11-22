@@ -261,6 +261,37 @@ internal sealed class Controls
             return new ReplyRow(String.Join(".", id), parts, OwnMessage(bubble));
         }).ToArray();
     }
+    internal string ExternalFieldEvidence(string key, string selfId, string peerId)
+    {
+        var bubble = Bubbles.Single(e => String.Join(".", e.GetRuntimeId()) == key);
+        var roots = new List<AutomationElement> { bubble };
+        var walker = TreeWalker.RawViewWalker;
+        for (var node = walker.GetParent(bubble); node != null && !node.Equals(History); node = walker.GetParent(node))
+        {
+            if (!HasClass(node, "message-container") && !HasClass(node, "message-container--self")) continue;
+            roots.Add(node);
+            break;
+        }
+        var rowFields = roots.SelectMany(e => new[] { e }.Concat(RawDescendants(e, 3).Take(60))).Distinct().ToArray();
+        var headerFields = new[] { Header }.Concat(RawDescendants(Header, 2).Take(20)).ToArray();
+        return "row-" + FieldMatches(rowFields, selfId, peerId) + " header-" + FieldMatches(headerFields, selfId, peerId);
+    }
+    private static string FieldMatches(AutomationElement[] elements, string selfId, string peerId)
+    {
+        var p = new[] { AutomationElement.NameProperty, AutomationElement.AutomationIdProperty,
+            AutomationElement.HelpTextProperty, AutomationElement.ItemStatusProperty, AutomationElement.ItemTypeProperty };
+        var found = new List<string>();
+        foreach (var property in p)
+        {
+            var values = elements.Select(e => e.GetCurrentPropertyValue(property, true) as string ?? "");
+            foreach (var value in values)
+            {
+                if (Regex.IsMatch(value, @"(?<![0-9])" + selfId + @"(?![0-9])")) found.Add("self." + property.ProgrammaticName);
+                if (Regex.IsMatch(value, @"(?<![0-9])" + peerId + @"(?![0-9])")) found.Add("peer." + property.ProgrammaticName);
+            }
+        }
+        return "fields=" + (found.Count == 0 ? "no-known-id" : String.Join(",", found.Distinct())) + " nodes=" + elements.Length;
+    }
     private static bool? OwnMessage(AutomationElement bubble)
     {
         var walker = TreeWalker.RawViewWalker;

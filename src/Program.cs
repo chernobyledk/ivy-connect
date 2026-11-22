@@ -32,11 +32,13 @@ internal static partial class Program
                  arguments[1] == "--verify-covered-small" || SelfTestForm.IsDesktopSingle(arguments[1])))
                 && arguments[0] == "--self-test";
             bool continuous = (arguments.Length == 1 || arguments.Length == 2) && arguments[0] == "--continuous";
+            bool external = arguments.Length == 2 && arguments[0] == "--external-private";
             if (arguments.Length != 0 && !autoMatrix && !awaitSelf && !typingPad && !baseline && !round2 &&
-                !region && !finishRegion && !msaaWitness && !fullOcclusionWitness && !continuous && !selfTest && !selfPad)
+                !region && !finishRegion && !msaaWitness && !fullOcclusionWitness && !continuous && !selfTest && !selfPad && !external)
                 return RunCommand(arguments);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            if (external) { Application.Run(new ExternalPrivateForm(arguments[1])); return 0; }
             if (typingPad) { TypingPad.Show(arguments); return 0; }
             if (selfPad) { TypingPad.ShowAutomatic(arguments); return 0; }
             if (selfTest) { Application.Run(new SelfTestForm(arguments.Length == 2 ? arguments[1] : null)); return 0; }
@@ -74,6 +76,12 @@ internal static partial class Program
 
     private static int RunCommand(string[] arguments)
     {
+        if (arguments.Length == 1 && arguments[0] == "--external-window-inventory")
+            return ExternalWindowSetup.Inventory();
+        if (arguments.Length == 2 && arguments[0] == "--external-restore")
+            return ExternalWindowSetup.Restore(Int64.Parse(arguments[1]));
+        if (arguments.Length == 2 && arguments[0] == "--external-hide-setup-window")
+            return ExternalWindowSetup.Hide(Int64.Parse(arguments[1]));
         if (arguments.Length == 1 && arguments[0] == "--inspect-verified-window")
             return Task.Run(() => LocalSendComparison.InspectWindow()).GetAwaiter().GetResult();
         if (arguments.Length >= 2 && arguments[0] == "--audit-verified-markers")

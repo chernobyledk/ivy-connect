@@ -14,17 +14,19 @@ internal static class MsaaProbe
         [MarshalAs(UnmanagedType.Interface)] out IAccessible accessible,
         [MarshalAs(UnmanagedType.Struct)] out object child);
 
-    internal static IAccessible FindMappedEditor(Target target, Controls ui)
+    internal static IAccessible FindMappedEditor(Target target, Controls ui, Action<string> structuralLog = null)
     {
         if (ui.Editor == null || !ui.Editor.Current.IsEnabled) return null;
         var rect = ui.Editor.Current.BoundingRectangle;
         var candidates = new List<IAccessible>();
+        var roots = new List<IAccessible>();
         Native.EnumChildWindows(target.Hwnd, (hwnd, data) => {
             if (Native.Class(hwnd) != "Chrome_RenderWidgetHostHWND") return true;
             var iid = Accessible;
             IAccessible root;
             if (AccessibleObjectFromWindow(hwnd, unchecked((uint)-4), ref iid, out root) != 0 || root == null)
                 return true;
+            if (structuralLog != null) roots.Add(root);
             try
             {
                 var node = root.accFocus as IAccessible;
@@ -36,7 +38,44 @@ internal static class MsaaProbe
             catch (COMException) { }
             return true;
         }, IntPtr.Zero);
-        return candidates.Count == 1 ? candidates[0] : null;
+        if (candidates.Count == 1)
+        {
+            if (structuralLog != null) structuralLog("MSAA editor source=renderer-retained-focus");
+            return candidates[0];
+        }
+        if (candidates.Count != 0 || structuralLog == null) return null;
+        var remaining = 4000;
+        foreach (var root in roots) FindInRenderer(root, rect, candidates, 0, ref remaining);
+        structuralLog("MSAA editor source=renderer-tree exact-editable-matches=" + candidates.Count +
+            " enumeration-complete=" + (remaining > 0));
+        return remaining > 0 && candidates.Count == 1 ? candidates[0] : null;
+    }
+    private static void FindInRenderer(IAccessible node, System.Windows.Rect rect,
+        List<IAccessible> matches, int depth, ref int remaining)
+    {
+        if (depth > 28) { remaining = 0; return; }
+        if (remaining-- <= 0) return;
+        try
+        {
+            if (MatchesBounds(node, 0, rect))
+            {
+                var role = node.get_accRole(0);
+                var state = node.get_accState(0);
+                if ((Equals(role, 0x14) || Equals(role, 0x2a)) && state is int &&
+                    (((int)state & 0x100041) == 0x100000) && node.get_accValue(0) != null &&
+                    !matches.Contains(node))
+                    matches.Add(node);
+            }
+            var children = node.accChildCount;
+            for (int index = 1; index <= children && remaining > 0; index++)
+            {
+                IAccessible child;
+                try { child = node.get_accChild(index) as IAccessible; }
+                catch (COMException) { continue; }
+                if (child != null) FindInRenderer(child, rect, matches, depth + 1, ref remaining);
+            }
+        }
+        catch (COMException) { }
     }
     private static bool MatchesBounds(IAccessible node, object child, System.Windows.Rect editor)
     {

@@ -27,17 +27,22 @@ internal sealed class ContinuousReply
     private string lastStatus;
     private Item inFlight;
     private int polls;
+    private readonly ExternalPrivateScope external;
+    private readonly ExternalPeerDriver peer;
 
     private sealed class Item
     {
         internal int Number;
         internal string Case, Reply, Phase;
+        internal ReplyRow Source;
     }
     internal ContinuousReply(Binding binding, string code, int limit, Func<bool> paused,
         Func<IntPtr> permittedForeground, ForegroundTrace trace, Action<string> log, Action<string> state,
-        CancellationToken cancel)
+        CancellationToken cancel, ExternalPrivateScope external = null, ExternalPeerDriver peer = null)
     {
-        if (!binding.Self) throw new InvalidOperationException("连续验证需要已核实的本人会话");
+        if (!binding.Self && external == null) throw new InvalidOperationException("连续验证需要已核实的本人会话");
+        this.external = external;
+        this.peer = peer;
         this.binding = binding;
         target = binding.Target;
         this.code = code;
@@ -91,8 +96,25 @@ internal sealed class ContinuousReply
         {
             if (row.Text.StartsWith(ReplyPrefix, StringComparison.Ordinal))
             {
+                if (external != null && !external.IsReply(row)) continue;
+                if (external != null && row.Own != true) throw new InvalidOperationException("回执的界面方向不明确");
                 ignoredReplies++;
                 log("ignored own-response prefix count=" + ignoredReplies);
+                continue;
+            }
+            if (external != null)
+            {
+                if (!external.IsInput(row)) continue;
+                if (row.Own != false) throw new InvalidOperationException("测试来信是本人发送或界面无法确认来信方向");
+                var itemNo = ++received;
+                if (itemNo > limit) throw new InvalidOperationException("来信数超过本轮计划");
+                var sameText = !inboundDigests.Add(row.Digest);
+                var incoming = new Item { Number = itemNo, Case = external.Scenario, Source = row, Phase = "queued",
+                    Reply = external.Reply(itemNo) };
+                log("read new item=" + itemNo + " body-exact=yes segments=" + row.Segments + " direction=incoming" +
+                    " bubble=" + MessageSnapshot.Hash(row.Key) + " sameTextAsEarlier=" + sameText + " time-source=local-observed");
+                queue.Enqueue(incoming);
+                log("queued item=" + itemNo);
                 continue;
             }
             if (row.Own != false || row.Text.StartsWith("TEST_IN", StringComparison.Ordinal) ||
@@ -137,14 +159,20 @@ internal sealed class ContinuousReply
     }
     private void RunBound()
     {
+        var fixedForeground = external == null ? IntPtr.Zero : permittedForeground();
+        var fixedEvents = trace.Count;
+        if (external != null) Guard(fixedForeground, fixedEvents);
         var first = Read(ui => ui.ReplyRows());
         Wait(380);
         var second = Read(ui => ui.ReplyRows());
         timeline.Seed(first, second);
+        if (external != null && second.Any(row => external.IsInput(row) || external.IsReply(row)))
+            throw new InvalidOperationException("本轮测试编号已经在基线中");
         log("baseline READY rows=" + second.Length + " code=" + code + " cap=" + limit +
             " phone-confirmation=separate");
         Status("已启动，等待新测试消息");
         var heartbeat = Stopwatch.StartNew();
+        Stopwatch quiet = null;
         try
         {
             while (true)
@@ -153,6 +181,8 @@ internal sealed class ContinuousReply
                 if (halt) { Wait(400); continue; }
                 try
                 {
+                    if (external != null) Guard(fixedForeground, fixedEvents);
+                    if (peer != null) peer.Poll(confirmed, () => Guard(fixedForeground, fixedEvents));
                     var ui = Read(controls => {
                         Discover(controls.ReplyRows());
                         return controls;
@@ -163,18 +193,35 @@ internal sealed class ContinuousReply
                         log("heartbeat polls=" + polls + " read=" + received + " confirmed=" + confirmed);
                         heartbeat.Restart();
                     }
-                    if (confirmed >= limit) { Status("达到本轮发送上限"); Wait(600); continue; }
+                    if (confirmed >= limit)
+                    {
+                        Status("达到本轮发送上限");
+                        if (external != null)
+                        {
+                            if (quiet == null) quiet = Stopwatch.StartNew();
+                            if (quiet.Elapsed.TotalSeconds >= 3 && (peer == null || peer.Receipts == limit))
+                            {
+                                if (ignoredReplies != limit)
+                                    throw new InvalidOperationException("未能在重复扫描中确认所有自身回执均被过滤");
+                                log("repeat-scan passed own-filtered=" + ignoredReplies + " no-additional-submit=yes");
+                                return;
+                            }
+                        }
+                        Wait(500);
+                        continue;
+                    }
                     if (paused()) { Status("手动暂停，仍记录新气泡"); Wait(500); continue; }
                     if (queue.Count == 0) { Status("等待新测试消息"); Wait(350); continue; }
                     var foreground = permittedForeground();
                     if (!ForegroundOk(foreground)) { Status("暂停：等待指定的其他前台软件"); Wait(400); continue; }
                     if (ui.HasVisibleConnectionWarning()) { Status("暂停：QQ 显示连接断开或正在重连"); Wait(600); continue; }
                     if (!ui.EmptyDraft()) { Status("暂停：输入框有草稿或未能确认空白"); Wait(500); continue; }
-                    Dispatch(queue.Peek(), foreground, trace.Count);
+                    Dispatch(queue.Peek(), foreground, external == null ? trace.Count : fixedEvents);
                 }
                 catch (OperationCanceledException) { throw; }
                 catch (Exception ex)
                 {
+                    if (external != null) throw;
                     Status("暂停：" + Experiment.Failure(ex));
                     Wait(600);
                 }
@@ -195,9 +242,10 @@ internal sealed class ContinuousReply
             timeline.CheckSameConversation(controls.ReplyRows());
             return controls;
         });
+        if (external != null) external.VerifySource(ui, binding, item.Source, item.Number, true);
         if (ui.HasVisibleConnectionWarning()) throw new InvalidOperationException("QQ 显示连接断开或正在重连");
         if (!ui.EmptyDraft()) throw new InvalidOperationException("写入前输入框出现草稿");
-        var mapped = MsaaProbe.FindMappedEditor(target, ui);
+        var mapped = MsaaProbe.FindMappedEditor(target, ui, external == null ? null : log);
         if (mapped == null) throw new InvalidOperationException("未能复核 MSAA 编辑对象");
         Guard(foreground, events);
         bool dispatched = false;
@@ -230,6 +278,7 @@ internal sealed class ContinuousReply
                 (action.CurrentState() & 1) != 0 || String.IsNullOrWhiteSpace(action.CurrentDefaultAction()))
                 throw new InvalidOperationException("发送按钮默认动作未就绪");
             Guard(foreground, events);
+            if (external != null) external.VerifySource(ui, binding, item.Source, item.Number, false);
             if (!binding.Matches(ui) || ui.Draft() != item.Reply)
                 throw new InvalidOperationException("发送前会话或草稿发生变化");
             if (ui.HasVisibleConnectionWarning()) throw new InvalidOperationException("发送前 QQ 显示连接断开或正在重连");
@@ -248,6 +297,7 @@ internal sealed class ContinuousReply
             item.Phase = dispatched ? "pending-confirmation" : "write-review";
             log(item.Phase + " item=" + item.Number + " reason=" + Experiment.Failure(ex) + "；不重发");
             Status(dispatched ? "待确认，已停发" : "待核对测试草稿，已停发");
+            if (external != null) throw;
             if (ex is OperationCanceledException) throw;
         }
     }
@@ -264,6 +314,12 @@ internal sealed class ContinuousReply
                 var count = snapshot.MarkerRows(item.Reply);
                 if (count > 1) throw new InvalidOperationException("回执编号出现多次");
                 if (count != 1 || !ui.EmptyDraft()) continue;
+                if (external != null)
+                {
+                    var matching = ui.ReplyRows().Where(row => row.Text == MessageSnapshot.Normalize(item.Reply)).ToArray();
+                    if (matching.Length != 1 || matching[0].Own != true) continue;
+                    log("local-bubble item=" + item.Number + " direction=outgoing bubble=" + MessageSnapshot.Hash(matching[0].Key));
+                }
                 confirmed++;
                 queue.Dequeue();
                 var retained = ForegroundOk(foreground) && trace.Count == events;
