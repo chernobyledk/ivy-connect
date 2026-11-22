@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <EnableDefaultItems>false</EnableDefaultItems>
+    <EnableDefaultPageItems>false</EnableDefaultPageItems>
+    <EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <StartupObject Condition="'$(StartupObject)' == ''">LabEntry</StartupObject>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AssemblyName>启动器</AssemblyName>
+    <AssemblyTitle>Ivy connect</AssemblyTitle>
+    <Product>Ivy connect</Product>
+    <Description>Ivy connect 桌面 QQ 自动回复 · 发布实验版</Description>
+    <Version>0.8.0</Version>
+    <ApplicationIcon>assets\launcher.ico</ApplicationIcon>
+    <ApplicationManifest>IvyConnect.manifest</ApplicationManifest>
+    <PublishTrimmed>false</PublishTrimmed>
+    <PublishAot>false</PublishAot>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <DebugType>embedded</DebugType>
+    <RuntimeFrameworkVersion>10.0.15</RuntimeFrameworkVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="*.cs" />
+    <Compile Include="$(QaEntry)" Condition="'$(QaEntry)' != ''" />
+    <EmbeddedResource Include="assets\launcher.ico" LogicalName="QQPrivateApp.LauncherIcon" />
+    <EmbeddedResource Include="assets\cover.jpg" LogicalName="QQPrivateApp.DefaultCover" />
+  </ItemGroup>
+</Project>

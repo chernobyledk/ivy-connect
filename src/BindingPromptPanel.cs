@@ -4,7 +4,7 @@ using System.Windows.Forms;
 
 internal sealed class BindingPromptPanel : TableLayoutPanel
 {
-    private readonly Label instruction = new Label { Dock = DockStyle.Fill, Padding = new Padding(6, 5, 0, 0) };
+    private readonly Label instruction = new Label { Dock = DockStyle.Fill, Padding = new Padding(6, 5, 0, 0), UseMnemonic = false };
     private readonly Label digits = new Label { Dock = DockStyle.Fill, Padding = new Padding(6, 0, 0, 0), TextAlign = ContentAlignment.MiddleLeft };
     private readonly Label progress = new Label { Dock = DockStyle.Fill, Padding = new Padding(6, 0, 0, 0), TextAlign = ContentAlignment.MiddleLeft };
     private readonly Button copy = new Button { Text = "复制验证码", AutoSize = true };
@@ -19,11 +19,12 @@ internal sealed class BindingPromptPanel : TableLayoutPanel
     internal BindingPromptPanel()
     {
         Dock = DockStyle.Top;
-        Height = 172;
-        Padding = new Padding(8, 0, 8, 0);
+        Height = 198;
+        Padding = new Padding(8, 3, 8, 0);
+        if (!SystemInformation.HighContrast) BackColor = Color.White;
         ColumnCount = 1;
         RowCount = 4;
-        RowStyles.Add(new RowStyle(SizeType.Absolute, 61));
+        RowStyles.Add(new RowStyle(SizeType.Absolute, 87));
         RowStyles.Add(new RowStyle(SizeType.Absolute, 45));
         RowStyles.Add(new RowStyle(SizeType.Absolute, 26));
         RowStyles.Add(new RowStyle(SizeType.Absolute, 36));
@@ -31,6 +32,9 @@ internal sealed class BindingPromptPanel : TableLayoutPanel
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Fill };
         var next = new Button { Text = "重新生成", AutoSize = true };
         var cancel = new Button { Text = "取消核验", AutoSize = true };
+        LabTheme.StyleButton(copy, LabTheme.Green);
+        LabTheme.StyleButton(next);
+        LabTheme.StyleButton(cancel);
         buttons.Controls.AddRange(new Control[] { copy, next, cancel });
         Controls.Add(instruction, 0, 0);
         Controls.Add(digits, 0, 1);

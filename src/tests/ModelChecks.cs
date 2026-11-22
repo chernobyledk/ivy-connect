@@ -8,7 +8,6 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Web.Script.Serialization;
 using System.Windows.Forms;
 
 internal sealed class LoopbackDeepSeek : IDisposable
@@ -93,8 +92,7 @@ internal sealed class LoopbackDeepSeek : IDisposable
                 if (read == 0) return;
                 pos += read;
             }
-            var json = new JavaScriptSerializer();
-            var request = (Dictionary<string, object>)json.DeserializeObject(Encoding.UTF8.GetString(body));
+            var request = ModelWire.Decode(Encoding.UTF8.GetString(body));
             var model = (string)request["model"];
             var messages = ((object[])request["messages"]).Cast<Dictionary<string, object>>().ToArray();
             var roles = String.Join(",", messages.Select(message => (string)message["role"]));
@@ -127,7 +125,7 @@ internal sealed class LoopbackDeepSeek : IDisposable
                     (string)messages[2]["content"] == "模拟首轮确认 " + marker) answer = "模拟第二轮，已带入上一轮 " + marker;
                 else { Write(stream, 400, "{}"); return; }
             }
-            Write(stream, 200, json.Serialize(new { choices = new[] { new { finish_reason = "stop",
+            Write(stream, 200, ModelWire.Encode(new { choices = new[] { new { finish_reason = "stop",
                 message = new { role = "assistant", content = answer, reasoning_content = "hidden test trace" } } } }));
         }
         catch (IOException) { }
@@ -294,7 +292,7 @@ internal static class ModelChecks
                 var settings = Settings(server, "test-normal");
                 var file = Path.Combine(root, "model-settings.dpapi");
                 ModelSettingsFile.Save(file, settings);
-                if (ui) { CheckForm(root); return; }
+                if (ui) { CheckForm(root); CheckResponsiveProbe(root, server); return; }
                 Assert(ModelSettingsFile.Load(file).ApiKey == LoopbackDeepSeek.Key &&
                     !Encoding.UTF8.GetString(File.ReadAllBytes(file)).Contains(LoopbackDeepSeek.Key), "model key DPAPI roundtrip");
                 using (var model = new HttpPrivateReply(settings, () => { throw new Exception("unexpected private context"); }, Ignore))
@@ -439,5 +437,54 @@ internal static class ModelChecks
     private static T PrivateField<T>(object instance, string name)
     {
         return (T)instance.GetType().GetField(name, System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance).GetValue(instance);
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern IntPtr FindWindow(string windowClass, string title);
+
+    [System.Runtime.InteropServices.DllImport("user32")]
+    private static extern bool PostMessage(IntPtr handle, uint message, IntPtr first, IntPtr second);
+
+    private static IEnumerable<Control> Children(Control parent)
+    {
+        foreach (Control child in parent.Controls)
+        {
+            yield return child;
+            foreach (var nested in Children(child)) yield return nested;
+        }
+    }
+
+    private static void CheckResponsiveProbe(string folder, LoopbackDeepSeek server)
+    {
+        using (var settings = new ModelConfigForm(folder, Ignore, () => { }))
+        using (var pulse = new System.Windows.Forms.Timer { Interval = 100 })
+        {
+            var ownProcess = System.Diagnostics.Process.GetCurrentProcess().Id;
+            var elapsed = System.Diagnostics.Stopwatch.StartNew();
+            var result = PrivateField<Label>(settings, "result");
+            var probe = Children(settings).OfType<Button>().Single(button => button.Text == "测试真实回答…");
+            PrivateField<TextBox>(settings, "model").Text = "test-delay";
+            int ticksWhileRequest = 0;
+            bool confirmed = false, completed = false;
+            pulse.Tick += (sender, args) => {
+                var prompt = FindWindow("#32770", "模型检查");
+                if (!confirmed && prompt != IntPtr.Zero && Native.Pid(prompt) == ownProcess)
+                    confirmed = PostMessage(prompt, 0x0111, new IntPtr(1), IntPtr.Zero);
+                completed = result.Text.Contains("真实模型已完成");
+                if (server.Delayed.WaitOne(0) && !completed) ticksWhileRequest++;
+                if (completed || elapsed.Elapsed.TotalSeconds > 10)
+                {
+                    pulse.Stop();
+                    settings.Close();
+                }
+            };
+            settings.Shown += (sender, args) => {
+                pulse.Start();
+                settings.BeginInvoke(new Action(() => probe.PerformClick()));
+            };
+            Application.Run(settings);
+            Assert(confirmed && completed && ticksWhileRequest >= 5,
+                "WinForms message pump remains responsive while the actual model dialog awaits delayed loopback HTTP");
+        }
     }
 }

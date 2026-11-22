@@ -7,8 +7,6 @@ using System.Windows.Forms;
 
 internal static class PresentationAssets
 {
-    internal static string DefaultCover { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "assets", "cover.jpg"); } }
-
     internal static Icon ReadIcon()
     {
         using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("QQPrivateApp.LauncherIcon"))
@@ -21,13 +19,25 @@ internal static class PresentationAssets
     internal static Bitmap ReadCover(string path)
     {
         using (var file = File.OpenRead(path))
+            return ReadCover(file);
+    }
+
+    internal static Bitmap ReadDefaultCover()
+    {
+        using (var embedded = Assembly.GetExecutingAssembly().GetManifestResourceStream("QQPrivateApp.DefaultCover"))
         {
-            if (file.Length == 0 || file.Length > 24L * 1024 * 1024) throw new InvalidDataException("图片文件过大或为空");
-            using (var source = Image.FromStream(file, true, true))
-            {
-                if ((long)source.Width * source.Height > 24L * 1024 * 1024) throw new InvalidDataException("图片像素过多");
-                return new Bitmap(source);
-            }
+            if (embedded == null) throw new FileNotFoundException("Embedded default cover missing");
+            return ReadCover(embedded);
+        }
+    }
+
+    private static Bitmap ReadCover(Stream file)
+    {
+        if (file.Length == 0 || file.Length > 24L * 1024 * 1024) throw new InvalidDataException("图片文件过大或为空");
+        using (var source = Image.FromStream(file, true, true))
+        {
+            if ((long)source.Width * source.Height > 24L * 1024 * 1024) throw new InvalidDataException("图片像素过多");
+            return new Bitmap(source);
         }
     }
 }
@@ -46,7 +56,7 @@ internal sealed class PictureCoverController : IDisposable
     internal PictureCoverController(string profile, Action<string> report, string defaultFile = null)
     {
         customFile = Path.Combine(profile, "qq-cover.user.png");
-        this.defaultFile = defaultFile ?? PresentationAssets.DefaultCover;
+        this.defaultFile = defaultFile;
         this.report = report;
         timer.Tick += (sender, args) => Update();
         Load(File.Exists(customFile));
@@ -58,7 +68,8 @@ internal sealed class PictureCoverController : IDisposable
         string status;
         try
         {
-            next = PresentationAssets.ReadCover(custom ? customFile : defaultFile);
+            next = custom ? PresentationAssets.ReadCover(customFile) :
+                defaultFile == null ? PresentationAssets.ReadDefaultCover() : PresentationAssets.ReadCover(defaultFile);
             status = custom ? "自选图片" : "默认图片";
         }
         catch (Exception error)

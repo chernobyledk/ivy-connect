@@ -11,16 +11,20 @@ internal sealed class PrivateCoreForm : Form
     private readonly string folder;
     private readonly Predicate<ReplyRow> acceptIncoming;
     private readonly TextBox[] fields = Enumerable.Range(0, 5).Select(i => new TextBox()).ToArray();
-    private readonly Label status = new Label { Dock = DockStyle.Fill, Padding = new Padding(8) };
-    private readonly Label connectionState = new Label { Dock = DockStyle.Top, Height = 26, Padding = new Padding(8, 6, 0, 0) };
-    private readonly Panel diagnostics = new Panel { Dock = DockStyle.Top, Height = 29, Visible = false };
+    private readonly TextBox status = new TextBox { Dock = DockStyle.Fill, Margin = new Padding(3, 5, 3, 2),
+        ReadOnly = true, Multiline = true, ScrollBars = ScrollBars.Vertical, BorderStyle = BorderStyle.None,
+        AccessibleName = "运行说明与下一步" };
+    private readonly Label connectionState = new Label { AutoSize = true, UseMnemonic = false };
+    private readonly Label runStage = new Label { AutoSize = true, UseMnemonic = false };
+    private readonly TableLayoutPanel diagnostics = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Visible = false, ColumnCount = 1 };
     private readonly CheckBox attested = new CheckBox { Text = "已从 QQ 资料卡核对双方号码，当前打开的是这个私聊", AutoSize = true };
-    private readonly Button bind = new Button { Text = "核验并绑定", AutoSize = true };
+    private readonly Button bind = new Button { Text = "核验 / 重新绑定", AutoSize = true };
     private readonly Button start = new Button { Text = "开始回复", AutoSize = true };
     private readonly Button pause = new Button { Text = "暂停", AutoSize = true };
     private readonly Button stop = new Button { Text = "停止", AutoSize = true };
     private readonly Button configure = new Button { Text = "模型与密钥", AutoSize = true };
-    private readonly Label modelSummary = new Label { Dock = DockStyle.Fill, Padding = new Padding(6, 3, 4, 2), AutoEllipsis = true };
+    private readonly Label modelSummary = new Label { Dock = DockStyle.Fill, Padding = new Padding(0, 5, 0, 4),
+        UseMnemonic = false, UseCompatibleTextRendering = true };
     private readonly Button clearContext = new Button { Text = "清空上下文", AutoSize = true };
     private readonly Button findQq = new Button { Text = "连接 QQ", AutoSize = true };
     private readonly Button pickQq = new Button { Text = "选择 QQ 窗口", AutoSize = true };
@@ -34,14 +38,15 @@ internal sealed class PrivateCoreForm : Form
     private readonly Button resetCover = new Button { Text = "恢复默认图片", AutoSize = true };
     private readonly Button recheckReceipt = new Button { Text = "重新核查", AutoSize = true };
     private readonly Button markPeerReceipt = new Button { Text = "确认对方已收到", AutoSize = true };
-    private readonly Label boundChat = new Label { Dock = DockStyle.Top, Height = 26, Padding = new Padding(8, 5, 0, 0) };
-    private readonly Label coverStatus = new Label { Dock = DockStyle.Bottom, Height = 25, Padding = new Padding(8, 4, 0, 0) };
+    private readonly Label boundChat = new Label { Dock = DockStyle.Fill, UseMnemonic = false };
+    private readonly Label coverStatus = new Label { AutoSize = true, UseMnemonic = false };
     private readonly BindingPromptPanel bindPrompt = new BindingPromptPanel();
+    private readonly Panel dashboardScroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, TabIndex = 1, TabStop = false };
     private readonly PictureCoverController pictureCover;
     private readonly Icon launcherIcon;
     private readonly QqPlacement placement = new QqPlacement();
     private readonly NotifyIcon tray = new NotifyIcon { Text = "Ivy connect" };
-    private readonly ComboBox mode = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 95 };
+    private readonly ComboBox mode = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 121 };
     private readonly object logGate = new object();
     private PrivateRunControl run;
     private CancellationTokenSource enrollment;
@@ -62,58 +67,13 @@ internal sealed class PrivateCoreForm : Form
         launcherIcon = PresentationAssets.ReadIcon();
         Icon = launcherIcon;
         tray.Icon = launcherIcon;
-        ClientSize = new Size(750, 721);
-        MinimumSize = new Size(670, 731);
+        AutoScaleDimensions = new SizeF(96, 96);
+        AutoScaleMode = AutoScaleMode.Dpi;
+        Font = LabTheme.Font();
+        ClientSize = new Size(775, 730);
+        MinimumSize = new Size(560, 410);
         StartPosition = FormStartPosition.CenterScreen;
-        var grid = new TableLayoutPanel { Dock = DockStyle.Top, Height = 177, Padding = new Padding(8),
-            ColumnCount = 2, RowCount = 5, GrowStyle = TableLayoutPanelGrowStyle.FixedSize };
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40));
-        grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 60));
-        for (int row = 0; row < 5; row++) grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
-        var labels = new[] { "自动回复账号 QQ 号（电脑端）", "聊天对象账号 QQ 号", "自动回复账号昵称",
-            "聊天对象昵称" };
-        for (int i = 0; i < labels.Length; i++)
-        {
-            grid.Controls.Add(new Label { Text = labels[i], Anchor = AnchorStyles.Left, AutoSize = true }, 0, i);
-            fields[i].Dock = DockStyle.Fill;
-            grid.Controls.Add(fields[i], 1, i);
-        }
-        attested.Anchor = AnchorStyles.Left;
-        grid.Controls.Add(attested, 0, 4);
-        grid.SetColumnSpan(attested, 2);
-        fields[4].ReadOnly = true;
-        fields[4].Width = 175;
-        fields[4].Location = new Point(148, 2);
-        diagnostics.Controls.Add(new Label { Text = "当前窗口句柄（十进制）", AutoSize = true, Location = new Point(8, 6) });
-        diagnostics.Controls.Add(fields[4]);
-        var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 68, Padding = new Padding(6) };
-        mode.Items.AddRange(new[] { "固定回复", "模型回复" });
-        mode.SelectedIndex = 0;
-        buttons.Controls.AddRange(new Control[] { bind, mode, start, pause, stop, clearContext });
-        var location = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 54, Padding = new Padding(6, 4, 6, 0) };
-        location.Controls.AddRange(new Control[] { findQq, pickQq, showQq, sideQq, restoreQq, advanced });
-        var masks = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 37, Padding = new Padding(6, 1, 6, 0) };
-        masks.Controls.AddRange(new Control[] { showCover, closeCover, chooseCover, resetCover });
-        var receipts = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 36, Padding = new Padding(6, 1, 6, 0) };
-        receipts.Controls.AddRange(new Control[] { recheckReceipt, markPeerReceipt });
-        var modelHeader = new TableLayoutPanel { Dock = DockStyle.Top, Height = 58, Padding = new Padding(6, 4, 6, 2), ColumnCount = 2 };
-        modelHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 108));
-        modelHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        configure.Dock = DockStyle.Fill;
-        modelHeader.Controls.Add(configure, 0, 0);
-        modelHeader.Controls.Add(modelSummary, 1, 0);
-        Controls.Add(status);
-        Controls.Add(buttons);
-        Controls.Add(location);
-        Controls.Add(masks);
-        Controls.Add(receipts);
-        Controls.Add(coverStatus);
-        Controls.Add(bindPrompt);
-        Controls.Add(diagnostics);
-        Controls.Add(grid);
-        Controls.Add(boundChat);
-        Controls.Add(connectionState);
-        Controls.Add(modelHeader);
+        BuildLayout();
         pictureCover = new PictureCoverController(folder, text => coverStatus.Text = text);
         DisplayBinding(null, false);
         SetConnection("未连接", "请在自动回复账号中打开目标私聊，然后点击「连接 QQ」或「开始回复」。");
@@ -129,7 +89,7 @@ internal sealed class PrivateCoreForm : Form
                     var saved = new[] { p.BotQq, p.PeerQq, p.BotDisplay, p.PeerDisplay };
                     for (int i = 0; i < saved.Length; i++) fields[i].Text = saved[i];
                     DisplayBinding(p, false);
-                    status.Text = Summary(store, "已有核验记录。在机器人 QQ 打开原私聊后，点击「连接 QQ」或「开始回复」。");
+                    status.Text = Summary(store, "已保存核验。打开原私聊后点「连接 QQ」或「开始回复」。");
                 }
             }
             Log("startup version=" + Application.ProductVersion + " pid=" + System.Diagnostics.Process.GetCurrentProcess().Id);
@@ -187,8 +147,8 @@ internal sealed class PrivateCoreForm : Form
         start.Click += async (s, e) => await StartCore();
         pause.Click += (s, e) => {
             if (run == null || run.Token.IsCancellationRequested) return;
-            if (run.Paused) { run.Resume(); pause.Text = "暂停"; status.Text = "正在复核后恢复…"; }
-            else { run.Pause(); pause.Text = "恢复"; status.Text = "已请求暂停。已提交动作继续核查。"; }
+            if (run.Paused) { run.Resume(); pause.Text = "暂停"; SetConnection("运行中", "正在复核后恢复…"); }
+            else { run.Pause(); pause.Text = "恢复"; SetConnection("暂停", "已请求暂停。已提交动作继续核查。"); }
         };
         stop.Click += (s, e) => RequestStop();
         FormClosing += (s, e) => {
@@ -206,6 +166,137 @@ internal sealed class PrivateCoreForm : Form
         UpdateButtons();
     }
 
+    private TableLayoutPanel Account(string title, int numberIndex, int nicknameIndex)
+    {
+        var card = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1, Padding = new Padding(12, 2, 12, 8) };
+        if (!SystemInformation.HighContrast) card.BackColor = Color.White;
+        card.Controls.Add(LabTheme.Section(title));
+        var labels = new[] { "QQ 号", "QQ 昵称" };
+        var indexes = new[] { numberIndex, nicknameIndex };
+        for (int i = 0; i < indexes.Length; i++)
+        {
+            var label = new Label { Text = labels[i], AutoSize = true };
+            var input = fields[indexes[i]];
+            input.AccessibleName = title + " " + labels[i];
+            input.Dock = DockStyle.Top;
+            input.MaxLength = i == 0 ? 12 : 60;
+            card.Controls.Add(label);
+            card.Controls.Add(input);
+        }
+        return card;
+    }
+
+    private void BuildLayout()
+    {
+        if (!SystemInformation.HighContrast) { BackColor = LabTheme.Surface; ForeColor = LabTheme.Ink; }
+        var buttonSet = new[] { bind, start, pause, stop, configure, clearContext, findQq, pickQq, advanced,
+            showQq, sideQq, restoreQq, showCover, closeCover, chooseCover, resetCover, recheckReceipt, markPeerReceipt };
+        foreach (var button in buttonSet) LabTheme.StyleButton(button);
+        LabTheme.StyleButton(start, LabTheme.Green);
+        LabTheme.StyleButton(stop, LabTheme.Danger);
+        LabTheme.StyleButton(configure, LabTheme.Green);
+
+        var header = new TableLayoutPanel { Dock = DockStyle.Top, Height = 95, ColumnCount = 2,
+            Padding = new Padding(18, 8, 16, 6), TabIndex = 0 };
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        if (!SystemInformation.HighContrast) header.BackColor = Color.White;
+        var title = new Label { Text = "Ivy connect", AutoSize = true, Font = LabTheme.Font(18, FontStyle.Bold), Margin = Padding.Empty };
+        var version = new Label { Text = "v" + Application.ProductVersion + "  ·  发布实验版", AutoSize = true, Font = LabTheme.Font(9), Margin = Padding.Empty };
+        var identity = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1, Margin = Padding.Empty };
+        identity.Controls.Add(title);
+        identity.Controls.Add(version);
+        configure.Anchor = AnchorStyles.Right;
+        header.Controls.Add(identity, 0, 0);
+        header.Controls.Add(configure, 1, 0);
+
+        var stateLine = LabTheme.Row(connectionState, runStage);
+        connectionState.Font = LabTheme.Font(11, FontStyle.Bold);
+        connectionState.Margin = new Padding(3, 5, 16, 2);
+        runStage.Margin = new Padding(3, 7, 2, 2);
+        var summary = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(12, 6, 12, 5), ColumnCount = 1 };
+        if (!SystemInformation.HighContrast) { summary.BackColor = Color.White; status.BackColor = Color.White; status.ForeColor = LabTheme.Ink; }
+        summary.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        summary.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
+        summary.RowStyles.Add(new RowStyle(SizeType.Absolute, 87));
+        summary.Controls.Add(stateLine, 0, 0);
+        summary.Controls.Add(status, 0, 1);
+        summary.Controls.Add(modelSummary, 0, 2);
+
+        var accounts = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2 };
+        accounts.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        accounts.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+        accounts.Controls.Add(Account("电脑端自动回复账号", 0, 2), 0, 0);
+        accounts.Controls.Add(Account("给它发消息的聊天对象", 1, 3), 1, 0);
+
+        var openData = new Button { Text = "打开数据目录" };
+        var backup = new Button { Text = "备份本机数据" };
+        LabTheme.StyleButton(openData);
+        LabTheme.StyleButton(backup);
+        openData.Click += (s, e) => DataAction(false);
+        backup.Click += (s, e) => DataAction(true);
+        fields[4].ReadOnly = true;
+        fields[4].Width = 175;
+        fields[4].AccessibleName = "自动获取的窗口句柄";
+        diagnostics.Controls.Add(LabTheme.Row(new Label { Text = "自动取得的窗口句柄", AutoSize = true }, fields[4], pickQq));
+        diagnostics.Controls.Add(LabTheme.Row(openData, backup, clearContext));
+
+        var body = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            ColumnCount = 1, Padding = new Padding(14, 8, 14, 12), TabIndex = 0 };
+        body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        body.Controls.Add(summary);
+        body.Controls.Add(LabTheme.Section("QQ 连接与会话"));
+        body.Controls.Add(accounts);
+        body.Controls.Add(boundChat);
+        body.Controls.Add(attested);
+        body.Controls.Add(LabTheme.Row(findQq, bind, showQq, advanced));
+        body.Controls.Add(bindPrompt);
+        body.Controls.Add(LabTheme.Section("窗口与遮罩"));
+        body.Controls.Add(LabTheme.Row(sideQq, restoreQq, showCover, closeCover, chooseCover, resetCover));
+        body.Controls.Add(coverStatus);
+        body.Controls.Add(LabTheme.Section("发送核查"));
+        body.Controls.Add(LabTheme.Row(markPeerReceipt));
+        body.Controls.Add(diagnostics);
+        dashboardScroll.Controls.Add(body);
+
+        mode.Items.AddRange(new[] { "固定回复", "模型回复" });
+        mode.AccessibleName = "回复方式";
+        mode.SelectedIndex = 0;
+        var actions = LabTheme.Row(mode, start, pause, stop, recheckReceipt);
+        actions.Dock = DockStyle.Bottom;
+        actions.Padding = new Padding(14, 5, 12, 6);
+        actions.TabIndex = 2;
+        if (!SystemInformation.HighContrast) actions.BackColor = Color.White;
+        Controls.Add(dashboardScroll);
+        Controls.Add(actions);
+        Controls.Add(header);
+        Shown += (sender, args) => {
+            var area = Screen.FromControl(this).WorkingArea;
+            if (Width > area.Width || Height > area.Height)
+                Size = new Size(Math.Min(Width, area.Width), Math.Min(Height, area.Height));
+        };
+    }
+
+    private void DataAction(bool backup)
+    {
+        try
+        {
+            if (!backup) LabData.OpenFolder(folder);
+            else
+            {
+                if (run != null || connecting || enrollment != null)
+                {
+                    SetConnection("需要停止", "请先停止回复或身份核验，再备份消息账本。");
+                    return;
+                }
+                var path = LabData.BackupNow(folder);
+                MessageBox.Show(this, "已备份并核对加密文件。副本供当前 Windows 用户恢复。", "本机数据备份");
+                LabData.OpenFolder(path);
+            }
+        }
+        catch (Exception ex) { SetConnection("数据错误", "无法操作本机数据目录。请检查权限和空间。类型 " + ex.GetType().Name); }
+    }
+
     private void ShowControl()
     {
         Show();
@@ -221,7 +312,12 @@ internal sealed class PrivateCoreForm : Form
 
     private void SetConnection(string state, string detail)
     {
-        connectionState.Text = "连接状态  " + state;
+        if (state == "已就绪" || state == "运行中") connectionState.Text = "QQ 连接 · 已就绪";
+        else if (state != "暂停" && state != "网络或模型错误" && state != "已提交待确认" && state != "已停止")
+            connectionState.Text = "QQ 连接 · " + state;
+        connectionState.ForeColor = LabTheme.StatusTone(connectionState.Text);
+        runStage.Text = "运行阶段 · " + state;
+        runStage.ForeColor = LabTheme.StatusTone(state);
         status.Text = detail;
     }
 
@@ -574,7 +670,7 @@ internal sealed class PrivateCoreForm : Form
         }
         if (discovery != null) discovery.Cancel();
         if (run != null) run.Stop();
-        status.Text = "正在停止，禁止新的提交。";
+        SetConnection("正在停止", "正在停止。未提交的回复将取消，已提交的回复继续保留核查记录。");
         UpdateButtons();
     }
     private void Report(string text, string state = null)
@@ -583,7 +679,14 @@ internal sealed class PrivateCoreForm : Form
             if (run != null && !run.Token.IsCancellationRequested || enrollment != null)
             {
                 if (state != null) SetConnection(state, text);
-                else status.Text = text;
+                else
+                {
+                    if (text.StartsWith("正在请求模型", StringComparison.Ordinal)) runStage.Text = "运行阶段 · 请求模型中";
+                    else if (text.StartsWith("已提交", StringComparison.Ordinal)) runStage.Text = "运行阶段 · 发送待确认";
+                    else if (text.StartsWith("准备", StringComparison.Ordinal)) runStage.Text = "运行阶段 · 发送前复核";
+                    if (run != null && run.Paused) runStage.Text = "运行阶段 · 暂停";
+                    status.Text = text;
+                }
                 if (run != null && run.Paused) pause.Text = "恢复";
             }
         }));
@@ -634,6 +737,7 @@ internal sealed class PrivateCoreForm : Form
                                 pending.Token, Log, challenge => PostEnrollment(pending, () => {
                                     issued = true;
                                     bindPrompt.ShowCode(challenge, a[2], a[0], a[3], a[1]);
+                                    dashboardScroll.ScrollControlIntoView(bindPrompt);
                                     status.Text = "等待来自当前私聊的新验证码。";
                                 }), failures => PostEnrollment(pending, () => bindPrompt.RecordFailure(failures)));
                             return Tuple.Create(next, previousStamp);

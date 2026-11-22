@@ -67,6 +67,16 @@ internal static class ModelNetwork
 
     internal static ModelReplyException TransportError(HttpRequestException error, string network)
     {
+#if NET10_0_OR_GREATER
+        if (error.StatusCode == HttpStatusCode.ProxyAuthenticationRequired)
+            return new ModelReplyException("proxy-auth", "代理要求认证或凭据未通过（HTTP 407）");
+        if (error.HttpRequestError == HttpRequestError.NameResolutionError)
+            return new ModelReplyException(network == Proxy ? "proxy-dns" : "dns", "无法解析当前网络路径的域名");
+        if (error.HttpRequestError == HttpRequestError.SecureConnectionError)
+            return new ModelReplyException("tls", "HTTPS 证书或 TLS 握手失败");
+        if (error.HttpRequestError == HttpRequestError.ProxyTunnelError)
+            return new ModelReplyException("proxy-tunnel", "HTTP 代理未能建立 HTTPS 隧道，请检查代理状态和凭据");
+#endif
         for (Exception current = error; current != null; current = current.InnerException)
         {
             if (current is AuthenticationException)

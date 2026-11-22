@@ -8,7 +8,11 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+#if NET10_0_OR_GREATER
+using System.Text.Json;
+#else
 using System.Web.Script.Serialization;
+#endif
 
 internal sealed class ModelReplyException : InvalidOperationException
 {
@@ -130,12 +134,54 @@ internal static class ModelWire
     {
         try
         {
+            if (text == null || text.Length > 1048576) throw Format("模型响应超出读取限制");
+#if NET10_0_OR_GREATER
+            using (var document = JsonDocument.Parse(text, new JsonDocumentOptions { MaxDepth = 48 }))
+            {
+                var parsed = Map(ReadJson(document.RootElement));
+                if (parsed != null) return parsed;
+            }
+#else
             var parsed = Map(new JavaScriptSerializer { MaxJsonLength = 1048576, RecursionLimit = 48 }.DeserializeObject(text));
             if (parsed != null) return parsed;
+#endif
         }
+#if NET10_0_OR_GREATER
+        catch (JsonException) { }
+#endif
         catch (ArgumentException) { }
         catch (InvalidOperationException) { }
         throw Format("响应不是约定的 JSON 对象");
+    }
+
+#if NET10_0_OR_GREATER
+    private static object ReadJson(JsonElement value)
+    {
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Object:
+                var fields = new Dictionary<string, object>(StringComparer.Ordinal);
+                foreach (var field in value.EnumerateObject()) fields[field.Name] = ReadJson(field.Value);
+                return fields;
+            case JsonValueKind.Array: return value.EnumerateArray().Select(ReadJson).ToArray();
+            case JsonValueKind.String: return value.GetString();
+            case JsonValueKind.True: return true;
+            case JsonValueKind.False: return false;
+            case JsonValueKind.Number:
+                int number;
+                return value.TryGetInt32(out number) ? (object)number : value.GetRawText();
+            default: return null;
+        }
+    }
+#endif
+
+    internal static string Encode(object packet)
+    {
+#if NET10_0_OR_GREATER
+        return JsonSerializer.Serialize(packet);
+#else
+        return new JavaScriptSerializer().Serialize(packet);
+#endif
     }
 
     internal static Dictionary<string, object> Map(object node) { return node as Dictionary<string, object>; }
@@ -260,7 +306,7 @@ internal sealed class HttpPrivateReply : IPrivateReplyProvider, IDisposable
         log("model request id=" + correlation + " protocol=" + settings.Protocol + " network=" + settings.Network + " messages=" + messages.Count());
         try
         {
-            var body = new JavaScriptSerializer().Serialize(ModelWire.Request(settings, endpoint, messages));
+            var body = ModelWire.Encode(ModelWire.Request(settings, endpoint, messages));
             var packet = await Send(HttpMethod.Post, endpoint, body, cancellation).ConfigureAwait(false);
             cancellation.ThrowIfCancellationRequested();
             var answer = ModelWire.Answer(packet, settings);

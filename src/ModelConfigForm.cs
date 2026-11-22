@@ -14,7 +14,8 @@ internal sealed class ModelConfigForm : Form
     private readonly string folder;
     private readonly Action<string> log;
     private readonly Action clearContext;
-    private readonly Label result = new Label { Dock = DockStyle.Fill, Padding = new Padding(8), AutoEllipsis = true };
+    private readonly Label result = new Label { Dock = DockStyle.Fill, Padding = new Padding(8),
+        UseMnemonic = false, UseCompatibleTextRendering = true };
     private readonly Label keyState = new Label { AutoSize = true };
     private readonly Label thinkingNote = new Label { AutoSize = true, Padding = new Padding(0, 3, 0, 0) };
     private readonly ListBox profiles = new ListBox { Dock = DockStyle.Fill };
@@ -31,12 +32,14 @@ internal sealed class ModelConfigForm : Form
     private readonly NumericUpDown turns = new NumericUpDown { Minimum = 0, Maximum = 8 };
     private readonly NumericUpDown output = new NumericUpDown { Minimum = 0, Maximum = 32768, Width = 85 };
     private readonly FlowLayoutPanel actions = new FlowLayoutPanel(), profileActions = new FlowLayoutPanel();
-    private readonly TableLayoutPanel editor = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8), ColumnCount = 2 };
+    private readonly TabControl pages = new TabControl { Dock = DockStyle.Fill };
+    private TableLayoutPanel editor;
     private readonly Button identify = new Button { Text = "识别服务商", AutoSize = true };
     private readonly Label resolved = new Label { AutoEllipsis = true, Padding = new Padding(0, 3, 0, 0) };
     private readonly Label modelHint = new Label { AutoEllipsis = true, Padding = new Padding(0, 3, 0, 0) };
     private readonly Label proxyState = new Label { AutoEllipsis = true, Padding = new Padding(0, 3, 0, 0) };
     private readonly ToolTip tips = new ToolTip();
+    private readonly Icon dialogIcon;
     private PrivateModelCatalog catalog;
     private PrivateModelProfile editing;
     private CancellationTokenSource active;
@@ -48,7 +51,7 @@ internal sealed class ModelConfigForm : Form
     private static ComboBox DropDown() { return new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList }; }
     private static FlowLayoutPanel Line(params Control[] children)
     {
-        var panel = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
+        var panel = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = true, Margin = Padding.Empty };
         panel.Controls.AddRange(children);
         return panel;
     }
@@ -56,6 +59,7 @@ internal sealed class ModelConfigForm : Form
     private static Button ButtonFor(string label, Action click)
     {
         var button = new Button { Text = label, AutoSize = true };
+        LabTheme.StyleButton(button);
         button.Click += (s, e) => click();
         return button;
     }
@@ -66,10 +70,12 @@ internal sealed class ModelConfigForm : Form
         this.log = log;
         this.clearContext = clearContext;
         Text = "Ivy connect · 模型与密钥";
-        ClientSize = new Size(955, 746);
-        MinimumSize = new Size(845, 610);
+        dialogIcon = PresentationAssets.ReadIcon();
+        Icon = dialogIcon;
+        AutoScaleDimensions = new SizeF(96, 96); AutoScaleMode = AutoScaleMode.Dpi; Font = LabTheme.Font(); ClientSize = new Size(910, 550);
+        MinimumSize = new Size(650, 435); if (!SystemInformation.HighContrast) { BackColor = LabTheme.Surface; ForeColor = LabTheme.Ink; }
         StartPosition = FormStartPosition.CenterParent;
-        var hint = new Label { Dock = DockStyle.Top, Height = 46, Padding = new Padding(8, 6, 8, 0), Text =
+        var hint = new Label { Dock = DockStyle.Top, Height = 62, Padding = new Padding(8, 6, 8, 0), Text =
             (runningName == null ? "手动选择模型配置与密钥。" : "运行中的会话继续使用「" + runningName + "」的启动快照。") +
             "\r\n切换、编辑和删除在下一次停止并启动后生效。模型切换与当前 QQ 会话相互独立。" };
         provider.Items.AddRange(ModelCapabilities.Presets);
@@ -78,61 +84,96 @@ internal sealed class ModelConfigForm : Form
         tips.SetToolTip(proxy, "填已有代理的 http://地址:端口。HTTPS 模型仍验证服务器证书。");
         tips.SetToolTip(proxyUser, "可选代理用户名。留空保留同一代理的已保存用户名。");
         tips.SetToolTip(proxyPassword, "可选代理密码。留空保留同一代理的已保存密码。");
-        editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 116));
-        editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        var endpointRow = new TableLayoutPanel { ColumnCount = 2, Dock = DockStyle.Fill, Margin = Padding.Empty };
-        endpointRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-        endpointRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 104));
-        endpoint.Dock = DockStyle.Fill;
-        endpointRow.Controls.Add(endpoint, 0, 0);
-        endpointRow.Controls.Add(identify, 1, 0);
-        var sample = ButtonFor("填入示例", FillExample);
-        var clearRole = ButtonFor("清空角色", () => { roleName.Clear(); role.Clear(); });
-        var clearHistory = ButtonFor("清空聊天上下文…", clearContext);
+        LabTheme.StyleButton(identify);
+        endpoint.AccessibleName = "基础或完整 API 地址";
+        key.AccessibleName = "替换 API 密钥";
+        proxyUser.AccessibleName = "代理用户名";
+        proxyPassword.AccessibleName = "代理密码";
+        AddPage("服务与模型");
         AddRow("配置名称", name);
         AddRow("服务商", provider);
         AddRow("接口类型", protocol);
-        AddRow("基础或完整 API 地址", endpointRow, 32);
-        AddRow("实际请求地址", resolved);
-        AddRow("模型 / 接入点 ID", model);
-        AddRow("填写提示", modelHint, 32);
-        AddRow("替换 API 密钥", Line(key, removeKey), 30);
-        AddRow("密钥状态", keyState);
-        thinking.Width = 122;
-        AddRow("思考模式", Line(thinking, thinkingNote));
-        AddRow("思考强度", effort);
-        AddRow("超时 / 上下文", Line(timeout, new Label { Text = "秒　保留", AutoSize = true }, turns,
-            new Label { Text = "轮（0 为停用）", AutoSize = true }), 29);
-        AddRow("输出长度上限", Line(output, new Label { Text = "Token（0 为 Ivy 默认。思考可能占用输出预算）", AutoSize = true }));
+        AddRow("模型 ID", model);
+        AddRow("填写提示", modelHint, 45);
+        var showApi = new CheckBox { Text = "显示 API 地址与识别选项", AutoSize = true };
+        AddRow("高级连接", showApi);
+        var apiRows = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3, Visible = false };
+        apiRows.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        apiRows.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        apiRows.Controls.Add(new Label { Text = "基础或完整 API 地址", AutoSize = true }, 0, 0);
+        endpoint.Dock = DockStyle.Fill;
+        apiRows.Controls.Add(endpoint, 0, 1);
+        apiRows.Controls.Add(identify, 1, 1);
+        resolved.Dock = DockStyle.Fill;
+        apiRows.Controls.Add(resolved, 0, 2);
+        apiRows.SetColumnSpan(resolved, 2);
+        var apiRowIndex = editor.RowCount;
+        AddRow("", apiRows, 0);
+        editor.SetColumn(apiRows, 0);
+        editor.SetColumnSpan(apiRows, 2);
+        var serviceEditor = editor;
+        showApi.CheckedChanged += (s, e) => {
+            apiRows.Visible = showApi.Checked;
+            serviceEditor.RowStyles[apiRowIndex].Height = showApi.Checked ? showApi.Height * 5.8f : 0;
+        };
+        provider.SelectedIndexChanged += (s, e) => { if (Provider == PrivateModelSettings.Compatible) showApi.Checked = true; };
+
+        AddPage("密钥");
+        key.Width = 195;
+        AddRow("API 密钥", Line(key, removeKey), 63);
+        AddRow("密钥状态", keyState, 50);
+        AddPage("网络");
         AddRow("网络方式", network);
         AddRow("HTTP 代理地址", proxy);
-        AddRow("代理用户名 / 密码", Line(proxyUser, proxyPassword, removeProxyAuth));
-        AddRow("代理认证状态", proxyState);
+        AddRow("代理用户名", proxyUser);
+        AddRow("代理密码", proxyPassword);
+        AddRow("认证管理", removeProxyAuth);
+        AddRow("代理认证状态", proxyState, 55);
+
+        AddPage("生成设置");
+        thinking.Width = 122;
+        AddRow("思考模式", Line(thinking, thinkingNote), 65);
+        AddRow("思考强度", effort);
+        AddRow("请求超时", Line(timeout, new Label { Text = "秒", AutoSize = true }));
+        AddRow("输出上限", Line(output, new Label { Text = "Token（0 使用默认上限）", AutoSize = true }), 57);
+        AddPage("角色与上下文");
+        AddRow("上下文", Line(turns, new Label { Text = "轮（0 为停用）", AutoSize = true }));
         AddRow("角色名称", roleName);
-        AddRow("角色设定", role, 58);
-        AddRow("角色操作", Line(sample, clearRole, clearHistory), 35);
+        AddRow("角色设定", role, 96);
+        AddRow("角色操作", Line(ButtonFor("填入示例", FillExample),
+            ButtonFor("清空角色", () => { roleName.Clear(); role.Clear(); }),
+            ButtonFor("清空聊天上下文…", clearContext)), 90);
+
         actions.Dock = DockStyle.Bottom;
-        actions.Height = 43;
-        actions.Controls.AddRange(new[] { ButtonFor("加密保存", Save), ButtonFor("设为当前配置", SelectCurrent),
+        actions.AutoSize = true;
+        var save = ButtonFor("加密保存", Save);
+        LabTheme.StyleButton(save, LabTheme.Green);
+        actions.Controls.AddRange(new[] { save, ButtonFor("设为当前", SelectCurrent),
             ButtonFor("轻量检查", async () => await Check("check")), ButtonFor("查询模型列表", async () => await Check("list")),
             ButtonFor("测试真实回答…", async () => await Check("answer")) });
         profileActions.Dock = DockStyle.Bottom;
-        profileActions.Height = 74;
+        profileActions.AutoSize = true;
         profileActions.Controls.AddRange(new[] { ButtonFor("新增", StartNew), ButtonFor("复制…", Duplicate), ButtonFor("删除…", Remove) });
-        var left = new Panel { Dock = DockStyle.Left, Width = 215, Padding = new Padding(6) };
+        var left = new Panel { Dock = DockStyle.Left, Width = 170, Padding = new Padding(8, 0, 8, 4), TabIndex = 0 };
         left.Controls.Add(profiles);
         left.Controls.Add(profileActions);
-        var right = new Panel { Dock = DockStyle.Fill };
-        var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
-        scroll.Controls.Add(editor);
+        var listLabel = LabTheme.Section("已保存配置");
+        listLabel.Dock = DockStyle.Top;
+        left.Controls.Add(listLabel);
+        var right = new Panel { Dock = DockStyle.Fill, TabIndex = 1 };
         result.Dock = DockStyle.Bottom;
-        result.Height = 48;
-        right.Controls.Add(scroll);
+        result.Height = 61;
+        right.Controls.Add(pages);
         right.Controls.Add(result);
         right.Controls.Add(actions);
         Controls.Add(right);
         Controls.Add(left);
         Controls.Add(hint);
+        Shown += (s, e) => {
+            var area = Screen.FromControl(this).WorkingArea;
+            if (Width > area.Width || Height > area.Height)
+                Size = new Size(Math.Min(Width, area.Width), Math.Min(Height, area.Height));
+        };
 
         identify.Click += (s, e) => Recognize();
         provider.SelectedIndexChanged += (s, e) => { if (!populating) ApplyPreset(); };
@@ -148,7 +189,7 @@ internal sealed class ModelConfigForm : Form
             if (!populating && profiles.SelectedItem is PrivateModelProfile) ShowProfile((PrivateModelProfile)profiles.SelectedItem);
         };
         FormClosing += (s, e) => { if (active != null) active.Cancel(); };
-        FormClosed += (s, e) => tips.Dispose();
+        FormClosed += (s, e) => { tips.Dispose(); dialogIcon.Dispose(); };
         try
         {
             catalog = ModelCatalogFile.Load(folder);
@@ -162,13 +203,26 @@ internal sealed class ModelConfigForm : Form
         }
     }
 
-    private void AddRow(string title, Control field, int height = 27)
+    private void AddPage(string title)
+    {
+        var content = new TabPage(title) { AutoScroll = true };
+        if (!SystemInformation.HighContrast) content.BackColor = Color.White;
+        editor = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(12), ColumnCount = 2 };
+        editor.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 126));
+        editor.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        content.Controls.Add(editor);
+        pages.TabPages.Add(content);
+    }
+
+    private void AddRow(string title, Control field, int height = 37)
     {
         var row = editor.RowCount++;
         editor.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
         var label = new Label { Text = title, AutoSize = true, Anchor = AnchorStyles.Left };
         editor.Controls.Add(label, 0, row);
         field.Dock = DockStyle.Fill;
+        if (String.IsNullOrEmpty(field.AccessibleName)) field.AccessibleName = title;
         editor.Controls.Add(field, 1, row);
     }
 
@@ -536,7 +590,7 @@ internal sealed class ModelConfigForm : Form
 
     private void SetBusy(bool busy)
     {
-        editor.Enabled = actions.Enabled = profiles.Enabled = profileActions.Enabled = !busy;
+        pages.Enabled = actions.Enabled = profiles.Enabled = profileActions.Enabled = !busy;
     }
 
     internal static string DisplayError(Exception error)

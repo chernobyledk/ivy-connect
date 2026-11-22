@@ -8,7 +8,6 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Web.Script.Serialization;
 
 internal static class MultimodelChecks
 {
@@ -155,7 +154,7 @@ internal static class MultimodelChecks
     {
         var body = ModelWire.Request(settings, settings.Validate(), new[] { new ModelMessage("system", "role"),
             new ModelMessage("user", "question"), new ModelMessage("assistant", "past-answer"), new ModelMessage("user", "new") });
-        return ModelWire.Decode(new JavaScriptSerializer().Serialize(body));
+        return ModelWire.Decode(ModelWire.Encode(body));
     }
 
     private static void Protocols()
@@ -219,14 +218,22 @@ internal static class MultimodelChecks
 
     private static void Network()
     {
+#if NET10_0_OR_GREATER
+        var before = HttpClient.DefaultProxy;
+#else
         var before = WebRequest.DefaultWebProxy;
+#endif
         using (var origin = new Fixture())
         using (var system = new Fixture(true))
         using (var proxy = new Fixture(true))
         {
             try
             {
+#if NET10_0_OR_GREATER
+                HttpClient.DefaultProxy = new ModelNetwork.ExplicitHttpProxy(new Uri(system.Address));
+#else
                 WebRequest.DefaultWebProxy = new ModelNetwork.ExplicitHttpProxy(new Uri(system.Address));
+#endif
                 var profile = At(PrivateModelSettings.Compatible, "fixture", ModelCapabilities.Responses);
                 profile.Endpoint = origin.Address;
                 profile.RolePrompt = "role";
@@ -266,7 +273,14 @@ internal static class MultimodelChecks
                 Reject("tls", () => { throw ModelNetwork.TransportError(new HttpRequestException("redacted",
                     new WebException("redacted", WebExceptionStatus.TrustFailure)), ModelNetwork.Direct); });
             }
-            finally { WebRequest.DefaultWebProxy = before; }
+            finally
+            {
+#if NET10_0_OR_GREATER
+                HttpClient.DefaultProxy = before;
+#else
+                WebRequest.DefaultWebProxy = before;
+#endif
+            }
         }
     }
 
