@@ -1,9 +1,13 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
+using System.Windows.Automation;
 using System.Windows.Forms;
 
 internal static class PrivateProfile
@@ -43,6 +47,47 @@ internal static class PrivateProfile
     }
 }
 
+internal enum QqConnectState
+{
+    NotConnected, NeedsLogin, NeedsChat, NeedsVerification, ChooseWindow, Hidden, Minimized,
+    Dialog, Reconnecting, Draft, Unreadable, Ready
+}
+
+internal sealed class QqCandidate
+{
+    internal Target Target;
+    internal long Window;
+    internal string Login, Chat, HeaderProof, LoginProof, Epoch;
+    internal bool Visible, Minimized, Enabled, LoginPrompt, ReadFailed, EditorReady, HasDraft, NetworkWarning, AnchorMatches;
+
+    internal bool CanVerify(string botDisplay, string chatDisplay)
+    {
+        return Visible && !Minimized && Enabled && EditorReady && !NetworkWarning && !HasDraft &&
+            !String.IsNullOrWhiteSpace(Login) && Login == botDisplay && Chat == chatDisplay;
+    }
+
+    public override string ToString()
+    {
+        var state = Minimized ? "已最小化" : !Visible ? "托盘隐藏" : !Enabled ? "有待处理的对话框" :
+            LoginPrompt ? "等待登录" : ReadFailed ? "暂时无法读取" : "已展开";
+        var kind = Target == null ? "QQ" : Target.Title.Length > 36 ? Target.Title.Substring(0, 36) + "…" : Target.Title;
+        return kind + " ｜ 登录显示名 " + (Login ?? "未识别") + " ｜ 当前会话 " + (Chat ?? "未识别") + " ｜ " + state;
+    }
+}
+
+internal sealed class QqConnectionResult
+{
+    internal readonly QqConnectState State;
+    internal readonly string Detail;
+    internal readonly QqCandidate[] Candidates;
+    internal readonly PrivateBindingProof Binding;
+
+    internal QqConnectionResult(QqConnectState state, string detail, QqCandidate[] candidates, PrivateBindingProof binding = null)
+    {
+        State = state; Detail = detail; Candidates = candidates; Binding = binding;
+    }
+}
+
 internal static class QqConnection
 {
     internal static bool IsRunning()
@@ -67,6 +112,7 @@ internal static class QqConnection
     internal static Target Pinned(PrivateBindingProof proof)
     {
         if (proof == null) throw new InvalidOperationException("没有已核验绑定，请先核对 QQ 资料卡");
+        if (!Native.IsWindow(new IntPtr(proof.Window))) throw new PrivateRouteLostException("保存的 QQ 窗口已关闭，请重新连接");
         var target = Target.FromKnownHandle(proof.Window);
         if (QqPrivateTransport.EpochOf(target) != proof.Epoch)
             throw new PrivateRouteLostException("已保存 QQ 窗口已换代，请打开原私聊并重新核验");
@@ -81,6 +127,146 @@ internal static class QqConnection
             throw new PrivateRouteLostException("没有唯一的已保存展开窗口，请打开机器人 QQ 和已核验私聊");
         using (var wire = new QqPrivateTransport(proof, guard, log)) wire.RequireReady();
         return target.Hwnd.ToInt64();
+    }
+
+    internal static QqCandidate[] Collect(PrivateBindingProof prior, Action guard, Action<string> log)
+    {
+        var targets = Target.List(true).Where(t => Native.Visible(t.Hwnd) ||
+            (prior != null && t.Hwnd.ToInt64() == prior.Window)).ToArray();
+        if (prior != null)
+        {
+            var old = new IntPtr(prior.Window);
+            log("saved hwnd=" + prior.Window + " exists=" + Native.IsWindow(old) + " pid=" + Native.Pid(old) +
+                " visible=" + Native.Visible(old) + " minimized=" + Native.IsIconic(old) +
+                " enumerated=" + targets.Any(t => t.Hwnd == old));
+        }
+        var candidates = targets.Select(t => Observe(t, prior, guard)).ToArray();
+        foreach (var row in candidates)
+            log("candidate hwnd=" + row.Target.Hwnd.ToInt64() + " pid=" + row.Target.Pid + " visible=" + row.Visible +
+                " minimized=" + row.Minimized + " enabled=" + row.Enabled + " login-known=" + (row.Login != null) +
+                " bot-ui-match=" + (prior != null && row.Login == prior.BotDisplay) +
+                " peer-header-match=" + (prior != null && row.Chat == prior.PeerDisplay) +
+                " session-proof=" + (prior != null && ExactProof(prior, row)) + " readable=" + !row.ReadFailed);
+        return candidates;
+    }
+
+    private static QqCandidate Observe(Target target, PrivateBindingProof prior, Action guard)
+    {
+        var row = new QqCandidate { Target = target, Window = target.Hwnd.ToInt64(), Epoch = QqPrivateTransport.EpochOf(target),
+            Visible = Native.Visible(target.Hwnd), Minimized = Native.IsIconic(target.Hwnd), Enabled = Native.IsWindowEnabled(target.Hwnd) };
+        if (!row.Visible || row.Minimized || !row.Enabled) return row;
+        for (int retry = 0; ; retry++)
+        {
+            guard();
+            try
+            {
+                var ui = Controls.Scan(target, true);
+                row.AnchorMatches = false;
+                row.HeaderProof = row.LoginProof = null;
+                row.Login = ui.ConnectionLoginDisplay();
+                row.Chat = ui.HeaderIdentity();
+                row.LoginPrompt = row.Login == null && row.Chat == null && ui.ShowsLoginPrompt();
+                row.EditorReady = ui.HasMessageArea && ui.Editor != null && ui.Editor.Current.IsEnabled && ui.Button != null;
+                row.NetworkWarning = ui.HasVisibleConnectionWarning();
+                if (prior != null && SameProcess(prior.Epoch, row.Epoch) && row.Chat == prior.PeerDisplay)
+                {
+                    row.HeaderProof = ui.ConnectionHeaderProof();
+                    row.LoginProof = ui.LoginEvidence(prior.BotDisplay);
+                    if (row.Login == null && row.LoginProof != null && row.LoginProof == prior.LoginProof)
+                        row.Login = prior.BotDisplay; // prior run-time avatar evidence is stronger than a display label
+                    if (row.HeaderProof == prior.HeaderProof && row.LoginProof == prior.LoginProof && !String.IsNullOrEmpty(prior.ChallengeAnchor))
+                        row.AnchorMatches = ui.ReplyRows().Count(r => r.Own == false && MessageSnapshot.Hash(r.Anchor) == prior.ChallengeAnchor) == 1;
+                }
+                row.HasDraft = row.EditorReady && prior != null && row.Login == prior.BotDisplay &&
+                    row.Chat == prior.PeerDisplay && !ui.EmptyDraft();
+                return row;
+            }
+            catch (ElementNotAvailableException) { }
+            catch (COMException) { }
+            catch (InvalidOperationException) { }
+            if (retry == 1) { row.ReadFailed = true; return row; }
+            Thread.Sleep(160);
+        }
+    }
+
+    private static bool SameProcess(string oldEpoch, string currentEpoch)
+    {
+        if (String.IsNullOrEmpty(oldEpoch) || String.IsNullOrEmpty(currentEpoch)) return false;
+        int a = oldEpoch.LastIndexOf('/'), b = currentEpoch.LastIndexOf('/');
+        return a > 0 && b > 0 && String.Equals(oldEpoch.Substring(0, a), currentEpoch.Substring(0, b), StringComparison.Ordinal);
+    }
+
+    private static bool ExactProof(PrivateBindingProof prior, QqCandidate row)
+    {
+        return !row.ReadFailed && row.Visible && !row.Minimized && row.Enabled &&
+            SameProcess(prior.Epoch, row.Epoch) && row.Login == prior.BotDisplay && row.Chat == prior.PeerDisplay &&
+            !String.IsNullOrEmpty(prior.LoginProof) && row.LoginProof == prior.LoginProof &&
+            !String.IsNullOrEmpty(prior.HeaderProof) && row.HeaderProof == prior.HeaderProof && row.AnchorMatches;
+    }
+
+    internal static QqConnectionResult Resolve(PrivateBindingProof prior, QqCandidate[] rows)
+    {
+        if (rows.Length == 0) return new QqConnectionResult(QqConnectState.NotConnected, "未发现 QQ 窗口。请打开 QQ 并登录。", rows);
+        if (prior == null)
+        {
+            if (rows.Any(row => row.LoginPrompt) && !rows.Any(row => row.Login != null))
+                return new QqConnectionResult(QqConnectState.NeedsLogin, "请先登录机器人 QQ。", rows);
+            return new QqConnectionResult(QqConnectState.NeedsVerification,
+                "尚无核验记录。填写双方 QQ 号及显示名，在 QQ 打开原私聊，选择窗口并核验。", rows);
+        }
+        var proven = rows.Where(row => ExactProof(prior, row)).ToArray();
+        if (proven.Length > 1) return new QqConnectionResult(QqConnectState.ChooseWindow, "有多个窗口呈现相同核验证据，请选择并重新核验。", rows);
+        if (proven.Length == 1)
+        {
+            var match = proven[0];
+            if (match.NetworkWarning) return new QqConnectionResult(QqConnectState.Reconnecting, "QQ 显示断线或正在重连。网络恢复后再重试。", rows);
+            if (!match.EditorReady) return new QqConnectionResult(QqConnectState.Unreadable, "已识别原私聊，输入框或发送按钮暂不可用。", rows);
+            if (match.HasDraft) return new QqConnectionResult(QqConnectState.Draft, "原私聊内有草稿。请先由本人处理草稿，再开始回复。", rows);
+            var hwnd = match.Window;
+            if (prior.Window == hwnd && prior.Epoch == match.Epoch)
+                return new QqConnectionResult(QqConnectState.Ready, "已找到并核验原私聊。", rows, prior);
+            return new QqConnectionResult(QqConnectState.Ready, "已重新定位原私聊。", rows, new PrivateBindingProof {
+                BotQq = prior.BotQq, PeerQq = prior.PeerQq, BotDisplay = prior.BotDisplay, PeerDisplay = prior.PeerDisplay,
+                Window = hwnd, Epoch = match.Epoch, LoginProof = prior.LoginProof, HeaderProof = prior.HeaderProof,
+                ChallengeAnchor = prior.ChallengeAnchor, VerifiedUtc = prior.VerifiedUtc, Version = Guid.NewGuid().ToString("N") });
+        }
+
+        var sameChat = rows.Where(row => row.Visible && !row.Minimized && row.Enabled && !row.ReadFailed &&
+            row.Login == prior.BotDisplay && row.Chat == prior.PeerDisplay).ToArray();
+        if (sameChat.Length > 1) return new QqConnectionResult(QqConnectState.ChooseWindow,
+            "有多个可能的私聊，显示名不足以核对身份。请选择正确窗口并重新核验。", rows);
+        if (sameChat.Length == 1)
+        {
+            if (sameChat[0].NetworkWarning) return new QqConnectionResult(QqConnectState.Reconnecting, "QQ 显示断线或正在重连。", rows);
+            if (sameChat[0].HasDraft) return new QqConnectionResult(QqConnectState.Draft, "请处理私聊中的草稿后再核验。", rows);
+            return new QqConnectionResult(QqConnectState.NeedsVerification,
+                "找到了显示名相符的私聊，但窗口或原入站验证记录已经变化。请核对双方资料卡并重新核验。", rows);
+        }
+        var saved = rows.FirstOrDefault(row => row.Epoch == prior.Epoch);
+        if (saved != null && saved.Minimized) return new QqConnectionResult(QqConnectState.Minimized,
+            "机器人 QQ 已最小化。请从任务栏恢复，或点击「显示 QQ」，再连接。", rows);
+        if (saved != null && !saved.Visible) return new QqConnectionResult(QqConnectState.Hidden,
+            "机器人 QQ 在系统托盘隐藏。请打开托盘中的机器人 QQ，或点击「显示 QQ」，再连接。", rows);
+        if (saved != null && !saved.Enabled) return new QqConnectionResult(QqConnectState.Dialog,
+            "机器人 QQ 有待处理的窗口。请完成 QQ 中的提示再连接。", rows);
+        if (rows.Any(row => row.LoginPrompt) && !rows.Any(row => row.Login == prior.BotDisplay))
+            return new QqConnectionResult(QqConnectState.NeedsLogin, "请登录保存的机器人 QQ，再打开目标私聊。", rows);
+        if (saved != null && saved.ReadFailed) return new QqConnectionResult(QqConnectState.Unreadable,
+            "原 QQ 窗口仍在，但无障碍控件暂不可读。请在 QQ 中打开目标私聊后重试。", rows);
+        if (rows.Any(row => row.Login == prior.PeerDisplay && row.Chat == prior.BotDisplay) && !rows.Any(row => row.Login == prior.BotDisplay))
+            return new QqConnectionResult(QqConnectState.NeedsChat, "目前看到的是对端登录的 QQ 界面。请切到机器人账号，在那里打开目标私聊。", rows);
+        return new QqConnectionResult(QqConnectState.NeedsChat, "请在机器人账号的 QQ 主窗打开目标私聊。窗口重开后如提示核验，请核对双方账号。", rows);
+    }
+
+    internal static QqConnectionResult Connect(PrivateBindingProof prior, Action guard, Action<string> log)
+    {
+        var result = Resolve(prior, Collect(prior, guard, log));
+        if (result.Binding != null)
+        {
+            using (var wire = new QqPrivateTransport(result.Binding, guard, log)) wire.RequireReady();
+        }
+        log("connect state=" + result.State + " candidates=" + result.Candidates.Length);
+        return result;
     }
 }
 

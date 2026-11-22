@@ -37,6 +37,7 @@ internal static partial class Native
     [DllImport("user32.dll")] internal static extern bool EnumWindows(EnumCallback cb, IntPtr data);
     [DllImport("user32.dll")] internal static extern bool EnumChildWindows(IntPtr parent, EnumCallback cb, IntPtr data);
     [DllImport("user32.dll")] internal static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] internal static extern bool IsWindow(IntPtr hwnd);
     [DllImport("user32.dll")] internal static extern bool IsWindowEnabled(IntPtr hwnd);
     [DllImport("user32.dll")] internal static extern bool IsIconic(IntPtr hwnd);
     [DllImport("user32.dll")] internal static extern bool IsZoomed(IntPtr hwnd);
@@ -131,11 +132,11 @@ internal sealed class Target
         WindowClass = Native.Class(hwnd);
         Start = process.StartTime;
     }
-    internal static List<Target> List()
+    internal static List<Target> List(bool includeHidden = false)
     {
         var result = new List<Target>();
         Native.EnumWindows((hwnd, data) => {
-            if (!Native.Visible(hwnd) || Native.Title(hwnd).Length == 0) return true;
+            if ((!includeHidden && !Native.Visible(hwnd)) || Native.Title(hwnd).Length == 0) return true;
             try
             {
                 using (var p = Process.GetProcessById(Native.Pid(hwnd)))

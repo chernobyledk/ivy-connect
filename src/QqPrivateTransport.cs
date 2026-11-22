@@ -31,6 +31,7 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
         CheckNumbers(proof.BotQq, proof.PeerQq);
         target = Target.FromKnownHandle(proof.Window);
         if (Epoch != proof.Epoch) throw new PrivateRouteLostException("QQ 窗口或进程代际已变化，请重新按号核验");
+        RequireWindow();
         binding = ReadStable(() => new Binding(target, false, true));
         Read();
         windowLease = new Mutex(false, @"Local\QQWindowLab.Continuous." + target.Hwnd.ToInt64());
@@ -43,9 +44,7 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
     private Controls Scan()
     {
         guard();
-        if (!target.SameWindow() || !Native.Visible(target.Hwnd) || Native.IsIconic(target.Hwnd) ||
-            !Native.IsWindowEnabled(target.Hwnd))
-            throw new PrivateRouteLostException("QQ 窗口已关闭、隐藏、最小化或被重建，请恢复展开后重新核验");
+        RequireWindow();
         var ui = Controls.Scan(target, true);
         RequireLiveIdentity(ui);
         if (ui.HasVisibleConnectionWarning()) throw new InvalidOperationException("QQ 界面显示断线或重新连接");
@@ -53,6 +52,14 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
             throw new PrivateRouteLostException("QQ 消息或编辑控件已失效，请重新核验");
         guard();
         return ui;
+    }
+
+    private void RequireWindow()
+    {
+        if (!target.SameWindow()) throw new PrivateRouteLostException("机器人 QQ 窗口已关闭或重建。请打开原私聊后重新连接");
+        if (Native.IsIconic(target.Hwnd)) throw new PrivateRouteLostException("机器人 QQ 已最小化。请从任务栏恢复，然后重新连接");
+        if (!Native.Visible(target.Hwnd)) throw new PrivateRouteLostException("机器人 QQ 已隐藏。请从系统托盘打开，然后重新连接");
+        if (!Native.IsWindowEnabled(target.Hwnd)) throw new PrivateRouteLostException("机器人 QQ 窗口被对话框禁用。请处理 QQ 中的提示，然后重新连接");
     }
 
     private void RequireLiveIdentity(Controls ui)

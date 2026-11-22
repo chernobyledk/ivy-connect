@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -45,8 +46,20 @@ internal static partial class Program
             if (privateLive) { Application.Run(new PrivateLiveCheck(arguments[1])); return 0; }
             if (privateForm)
             {
-                Application.Run(new PrivateCoreForm(PrivateProfile.Folder(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "phase3")));
+                using (var instance = new Mutex(false, @"Local\QQPrivateApp.Phase3.Control"))
+                {
+                    bool entered;
+                    try { entered = instance.WaitOne(0); }
+                    catch (AbandonedMutexException) { entered = true; }
+                    if (!entered)
+                    {
+                        MessageBox.Show("v0.3.1 控制窗已打开。请使用现有窗口或系统托盘中的控制窗。", "QQ 独立自动回复");
+                        return 2;
+                    }
+                    try { Application.Run(new PrivateCoreForm(PrivateProfile.Folder(
+                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "phase3"))); }
+                    finally { instance.ReleaseMutex(); }
+                }
                 return 0;
             }
             if (external) { Application.Run(new ExternalPrivateForm(arguments[1])); return 0; }

@@ -45,6 +45,11 @@ public sealed class PrivateState
     public PrivateModelTurn[] ModelTurns = new PrivateModelTurn[0];
 }
 
+internal sealed class PrivateProfileBusyException : IOException
+{
+    internal PrivateProfileBusyException(IOException cause) : base("另一个 APP 实例正在使用此绑定。请停止或关闭旧控制窗后重试。", cause) { }
+}
+
 internal sealed class PrivateStore : IDisposable
 {
     private static readonly XmlSerializer Serializer = new XmlSerializer(typeof(PrivateState));
@@ -56,7 +61,12 @@ internal sealed class PrivateStore : IDisposable
     {
         Directory.CreateDirectory(folder);
         path = Path.Combine(folder, "private-state.dpapi");
-        lease = File.Open(Path.Combine(folder, "state.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+        try { lease = File.Open(Path.Combine(folder, "state.lock"), FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None); }
+        catch (IOException ex)
+        {
+            if ((ex.HResult & 0xffff) == 32 || (ex.HResult & 0xffff) == 33) throw new PrivateProfileBusyException(ex);
+            throw;
+        }
         try
         {
             State = File.Exists(path) ? Load(path) : new PrivateState();

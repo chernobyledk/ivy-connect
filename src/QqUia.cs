@@ -138,6 +138,35 @@ internal sealed class Controls
     {
         return Header == null ? null : Header.Current.Name.Trim();
     }
+
+    internal string ConnectionLoginDisplay()
+    {
+        var avatars = Nodes(origin, TreeScope.Descendants, Is(AutomationElement.ControlTypeProperty, ControlType.Button))
+            .Where(node => HasClass(node, "user-avatar"))
+            .Where(node => {
+                var parent = TreeWalker.RawViewWalker.GetParent(node);
+                return parent != null && HasClass(parent, "user-profile-card__avatar");
+            });
+        var avatar = Unique(avatars);
+        if (avatar == null) return null;
+        var name = avatar.Current.Name;
+        const string suffix = "的头像";
+        return name.EndsWith(suffix, StringComparison.Ordinal) ? name.Substring(0, name.Length - suffix.Length) : null;
+    }
+
+    internal bool ShowsLoginPrompt()
+    {
+        var prompt = new OrCondition(new[] { "登录", "扫码登录", "立即登录", "密码登录", "QQ登录" }
+            .Select(text => (Condition)Is(AutomationElement.NameProperty, text)).ToArray());
+        return Nodes(origin, TreeScope.Descendants, new AndCondition(prompt,
+            Is(AutomationElement.ControlTypeProperty, ControlType.Button))).Any(node => !node.Current.IsOffscreen);
+    }
+
+    internal string ConnectionHeaderProof()
+    {
+        var identity = HeaderIdentity();
+        return String.IsNullOrWhiteSpace(identity) ? null : MessageSnapshot.Hash(identity + "\n" + String.Join(".", Header.GetRuntimeId()));
+    }
     internal string LoginEvidence(string expectedDisplay)
     {
         if (String.IsNullOrWhiteSpace(expectedDisplay)) return null;
