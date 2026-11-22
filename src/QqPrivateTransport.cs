@@ -2,12 +2,13 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Automation;
 
-internal sealed class QqPrivateTransport : IPrivateTransport, IDisposable
+internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTransport, IDisposable
 {
     private readonly Target target;
     private readonly Binding binding;
@@ -29,9 +30,9 @@ internal sealed class QqPrivateTransport : IPrivateTransport, IDisposable
         this.log = log;
         CheckNumbers(proof.BotQq, proof.PeerQq);
         target = Target.FromKnownHandle(proof.Window);
-        if (Epoch != proof.Epoch) throw new InvalidOperationException("QQ 窗口或进程代际已变化，请重新按号核验");
-        binding = ReadStable(() => new Binding(target, false));
-        ReadStable(Scan);
+        if (Epoch != proof.Epoch) throw new PrivateRouteLostException("QQ 窗口或进程代际已变化，请重新按号核验");
+        binding = ReadStable(() => new Binding(target, false, true));
+        Read();
         windowLease = new Mutex(false, @"Local\QQWindowLab.Continuous." + target.Hwnd.ToInt64());
         bool owns;
         try { owns = windowLease.WaitOne(0); }
@@ -44,21 +45,37 @@ internal sealed class QqPrivateTransport : IPrivateTransport, IDisposable
         guard();
         if (!target.SameWindow() || !Native.Visible(target.Hwnd) || Native.IsIconic(target.Hwnd) ||
             !Native.IsWindowEnabled(target.Hwnd))
-            throw new InvalidOperationException("QQ 窗口隐藏、真正最小化或不可用");
-        var ui = binding.RequireMatch();
-        if (binding.HeaderProof != proof.HeaderProof || ui.HeaderIdentity() != proof.PeerDisplay ||
-            ui.LoginEvidence(proof.BotDisplay) != proof.LoginProof)
-            throw new InvalidOperationException("登录界面或私聊绑定已变化，需重新核验");
+            throw new PrivateRouteLostException("QQ 窗口已关闭、隐藏、最小化或被重建，请恢复展开后重新核验");
+        var ui = Controls.Scan(target, true);
+        RequireLiveIdentity(ui);
         if (ui.HasVisibleConnectionWarning()) throw new InvalidOperationException("QQ 界面显示断线或重新连接");
         if (!ui.HasMessageArea || ui.Editor == null || !ui.Editor.Current.IsEnabled || ui.Button == null)
-            throw new InvalidOperationException("QQ 消息或编辑控件已失效");
+            throw new PrivateRouteLostException("QQ 消息或编辑控件已失效，请重新核验");
         guard();
         return ui;
     }
 
+    private void RequireLiveIdentity(Controls ui)
+    {
+        if (!binding.Matches(ui) || binding.HeaderProof != proof.HeaderProof || ui.HeaderIdentity() != proof.PeerDisplay ||
+            String.IsNullOrEmpty(proof.LoginProof) || ui.LoginEvidence(proof.BotDisplay) != proof.LoginProof)
+            throw new PrivateRouteLostException("登录账号或私聊界面证据变化，旧任务已停发");
+    }
+
+    private ReplyRow[] BoundRows(Controls ui)
+    {
+        var rows = ui.ReplyRows();
+        if (String.IsNullOrEmpty(proof.ChallengeAnchor) ||
+            rows.Count(row => row.Own == false && MessageSnapshot.Hash(row.Anchor) == proof.ChallengeAnchor) != 1)
+            throw new PrivateRouteLostException("当前消息列表未找到唯一的原会话入站核验锚点，请重新核验");
+        return rows;
+    }
+
     private T ReadStable<T>(Func<T> read)
     {
-        return ReadStable(read, guard, log);
+        try { return ReadStable(read, guard, log); }
+        catch (ElementNotAvailableException) { throw new PrivateRouteLostException("QQ 界面节点重建，有限重读后仍无法核验原会话"); }
+        catch (COMException ex) { throw new PrivateRouteLostException("QQ 无障碍读取不稳定，请重新核验，错误码 0x" + ex.HResult.ToString("X8")); }
     }
 
     private static T ReadStable<T>(Func<T> read, Action guard, Action<string> log)
@@ -73,66 +90,101 @@ internal sealed class QqPrivateTransport : IPrivateTransport, IDisposable
                 log("UIA transient node: retry read only");
                 Thread.Sleep(250);
             }
+            catch (COMException ex)
+            {
+                if (attempt == 2) throw;
+                log("UIA COM read retry only hr=0x" + ex.HResult.ToString("X8"));
+                Thread.Sleep(250);
+            }
         }
     }
 
-    public ReplyRow[] Read() { return ReadStable(() => Scan().ReplyRows()); }
+    public ReplyRow[] Read() { return ReadStable(() => BoundRows(Scan())); }
+
+    public ReplyRow[] ReadAfterSubmit(out bool draftEmpty)
+    {
+        var observed = ReadStable(() => {
+            var scene = Scan();
+            return Tuple.Create(BoundRows(scene), scene.EmptyDraft());
+        });
+        draftEmpty = observed.Item2;
+        return observed.Item1;
+    }
 
     public void RequireReady()
     {
         if (!ReadStable(() => Scan().EmptyDraft())) throw new InvalidOperationException("QQ 输入框有草稿或无法确认空白");
     }
 
-    public void Submit(string text, Action verifyBefore, Action<Action> commit)
+    void IPrivateTransport.Submit(string text, Action verifyBefore, Action<Action> commit)
     {
-        verifyBefore();
-        var mapped = ReadStable(() => {
-            var current = Scan();
-            if (!current.EmptyDraft()) throw new InvalidOperationException("QQ 输入框存在草稿");
-            return MsaaProbe.FindMappedEditor(target, current, log);
+        throw new InvalidOperationException("QQ 发送必须走完整的写入与提交核验");
+    }
+
+    public void SubmitChecked(string text, Action<ReplyRow[]> verify, Action<Action, Action> commit, Action<string> checkpoint)
+    {
+        var prepared = ReadStable(() => {
+            var scene = Scan();
+            var rows = BoundRows(scene);
+            verify(rows);
+            RequireBackground();
+            if (!scene.EmptyDraft()) throw new InvalidOperationException("QQ 输入框有人工草稿，已暂停");
+            var nativeEditor = MsaaProbe.FindMappedEditor(target, scene, log);
+            if (nativeEditor == null) throw new InvalidOperationException("MSAA 编辑对象未可靠匹配");
+            // These are live reads from the scene whose native editor was just mapped.
+            RequireLiveIdentity(scene);
+            if (!scene.EmptyDraft()) throw new InvalidOperationException("写入前输入框出现草稿，已暂停");
+            return Tuple.Create(nativeEditor, rows);
         });
-        if (mapped == null) throw new InvalidOperationException("MSAA 编辑对象未可靠匹配");
-        verifyBefore();
-        RequireReady();
-        guard();
-        log("write-attempt method=MSAA.put_accValue");
-        var result = MsaaProbe.PutValue(mapped, text);
-        log("write-return hr=0x" + result.ToString("X8"));
-        if (result != 0) throw new InvalidOperationException("MSAA 写入失败，请核对草稿");
+        checkpoint("identity-before-write");
+        RequireBackground();
+        verify(prepared.Item2);
+        checkpoint("write-start");
+        if (MsaaProbe.PutValue(prepared.Item1, text) != 0) throw new InvalidOperationException("MSAA 写入失败，请核对草稿");
         var expected = text.Replace("\r\n", "\n");
         for (int attempt = 0; ; attempt++)
         {
-            Thread.Sleep(220);
-            verifyBefore();
-            var draft = ReadStable(() => {
-                var current = Scan();
-                return Tuple.Create(current.Draft(), current.EmptyDraft());
-            });
-            if (draft.Item1 == expected) break;
-            if (attempt >= 3 || !draft.Item2) throw new InvalidOperationException("写入后草稿回读不一致");
-        }
-        log("write-confirmed exact=yes");
-        verifyBefore();
-        var action = ReadStable(() => {
-            var current = Scan();
-            var button = current.Button;
-            var legacy = current.Legacy(button);
-            if (current.Draft() != expected || button == null || !button.Current.IsEnabled ||
-                legacy == null || legacy.CurrentRole() != 0x2b || (legacy.CurrentState() & 1) != 0 ||
-                String.IsNullOrWhiteSpace(legacy.CurrentDefaultAction()))
-                throw new InvalidOperationException("草稿或发送按钮默认动作变化，已停发");
-            return legacy;
-        });
-        verifyBefore();
-        if (ReadStable(() => Scan().Draft()) != expected)
-            throw new InvalidOperationException("提交前草稿内容变化");
-        guard();
-        commit(() => {
             guard();
-            log("send-action method=LegacyIAccessible.DoDefaultAction");
+            var draft = ReadStable(() => Scan().Draft());
+            if (draft == expected) break;
+            if (attempt >= 2) throw new InvalidOperationException("写入后草稿回读不一致，草稿已保留");
+            // Renderer can replace the editor after the write. Reacquire it without writing again.
+            log("write-verification waiting for a fresh UIA read");
+            Thread.Sleep(120);
+        }
+        checkpoint("write-confirm");
+        LegacyEditor.ILegacy action = null;
+        commit(() => {
+            // Acquire the action only after durable intent and the final full, live route check.
+            action = ReadStable(() => {
+                var current = Scan();
+                verify(BoundRows(current));
+                RequireBackground();
+                var button = current.Button;
+                var legacy = current.Legacy(button);
+                if (current.Draft() != expected || button == null || !button.Current.IsEnabled ||
+                    legacy == null || legacy.CurrentRole() != 0x2b || (legacy.CurrentState() & 1) != 0 ||
+                    String.IsNullOrWhiteSpace(legacy.CurrentDefaultAction()))
+                    throw new InvalidOperationException("提交前草稿或发送按钮已变化，未发送");
+                RequireLiveIdentity(current);
+                return legacy;
+            });
+            checkpoint("identity-before-submit");
+            RequireBackground();
+        }, () => {
+            guard();
             var hr = action.DoDefaultAction();
             log("send-return hr=0x" + hr.ToString("X8"));
         });
+    }
+
+    private void RequireBackground()
+    {
+        guard();
+        if (!target.SameWindow() || !Native.Visible(target.Hwnd) || Native.IsIconic(target.Hwnd))
+            throw new PrivateRouteLostException("窗口已变化或未展开");
+        if (Native.Pid(Native.GetForegroundWindow()) == target.Pid)
+            throw new InvalidOperationException("机器人 QQ 在前台，等待人工操作结束");
     }
 
     internal void ClearExactTestDraft(PrivateEvent item)
@@ -211,7 +263,7 @@ internal sealed class QqPrivateTransport : IPrivateTransport, IDisposable
     private static PrivateBindingProof Capture(Target target, Binding binding, string bot, string peer,
         string botDisplay, string peerDisplay, string login, string anchor)
     {
-        return new PrivateBindingProof { Window = target.Hwnd.ToInt64(), Epoch = EpochOf(target),
+        return new PrivateBindingProof { Window = target.Hwnd.ToInt64(), Epoch = EpochOf(target), Version = Guid.NewGuid().ToString("N"),
             BotQq = bot, PeerQq = peer, BotDisplay = botDisplay, PeerDisplay = peerDisplay,
             HeaderProof = binding.HeaderProof, LoginProof = login, ChallengeAnchor = anchor,
             VerifiedUtc = PrivateStore.Stamp() };

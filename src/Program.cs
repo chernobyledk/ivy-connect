@@ -45,8 +45,8 @@ internal static partial class Program
             if (privateLive) { Application.Run(new PrivateLiveCheck(arguments[1])); return 0; }
             if (privateForm)
             {
-                Application.Run(new PrivateCoreForm(Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QQPrivateApp", "phase2")));
+                Application.Run(new PrivateCoreForm(PrivateProfile.Folder(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "phase3")));
                 return 0;
             }
             if (external) { Application.Run(new ExternalPrivateForm(arguments[1])); return 0; }
@@ -87,6 +87,10 @@ internal static partial class Program
 
     private static int RunCommand(string[] arguments)
     {
+        if (arguments.Length == 3 && arguments[0] == "--route-fixture-copy")
+            return RouteDiagnostics.CopyFixture(arguments[1], arguments[2]);
+        if (arguments.Length == 2 && arguments[0] == "--route-benchmark")
+            return Task.Run(() => RouteDiagnostics.Benchmark(arguments[1])).GetAwaiter().GetResult();
         if (arguments.Length == 1 && arguments[0] == "--external-window-inventory")
             return ExternalWindowSetup.Inventory();
         if (arguments.Length == 2 && arguments[0] == "--external-restore")

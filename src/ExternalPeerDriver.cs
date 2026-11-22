@@ -12,18 +12,20 @@ internal sealed class ExternalPeerDriver
     private readonly Action<string> log;
     private readonly CancellationToken cancel;
     private readonly Func<int, string> replyForItem;
+    private readonly Func<int, string> inputForItem;
     private readonly Stopwatch receiptWait = Stopwatch.StartNew();
     private int probes, receipts;
     private string[] sentKeys = new string[0];
     internal int Receipts { get { return receipts; } }
 
     internal ExternalPeerDriver(ExternalPrivateScope scope, Target receiver, Action<string> log, CancellationToken cancel,
-        Func<int, string> replyForItem = null, string expectedHeaderProof = null)
+        Func<int, string> replyForItem = null, string expectedHeaderProof = null, Func<int, string> inputForItem = null)
     {
         this.scope = scope;
         this.log = log;
         this.cancel = cancel;
         this.replyForItem = replyForItem ?? scope.Reply;
+        this.inputForItem = inputForItem ?? (_ => scope.Marker);
         var target = Target.FromKnownHandle(scope.PeerWindow);
         if (target.Pid == receiver.Pid) throw new InvalidOperationException("两个 QQ 客户端须来自独立 QQ 进程");
         endpoint = Observe(() => new Binding(target, false));
@@ -34,10 +36,15 @@ internal sealed class ExternalPeerDriver
             if (!ui.EmptyDraft()) throw new InvalidOperationException("发件端输入框非空");
             return ui.ReplyRows();
         });
-        if (rows.Any(row => scope.IsInput(row) || scope.IsReply(row)))
+        if (rows.Any(row => IsTestInput(row) || scope.IsReply(row)))
             throw new InvalidOperationException("发件端已存在本轮的测试编号");
         log("peer-window bound process-distinct=yes hwnd=" + endpoint.Target.Hwnd.ToInt64() +
             " pid=" + endpoint.Target.Pid + " header-binding=" + endpoint.HeaderProof + " baseline-test-markers=0");
+    }
+
+    private bool IsTestInput(ReplyRow row)
+    {
+        return Enumerable.Range(1, scope.Limit).Any(n => row.Text == MessageSnapshot.Normalize(inputForItem(n)));
     }
 
     private Controls Scan()
@@ -73,7 +80,9 @@ internal sealed class ExternalPeerDriver
         while (receipts < localConfirmed)
         {
             var marker = MessageSnapshot.Normalize(replyForItem(receipts + 1));
-            var received = rows.Where(row => row.Text == marker).ToArray();
+            var ending = Array.FindIndex(rows, row => row.Key == sentKeys[receipts]);
+            if (ending < 0) throw new InvalidOperationException("对端来信锚点消失");
+            var received = rows.Skip(ending + 1).Where(row => row.Text == marker).ToArray();
             if (received.Length == 0)
             {
                 if (receiptWait.Elapsed.TotalSeconds >= 22)
@@ -112,8 +121,9 @@ internal sealed class ExternalPeerDriver
         });
         if (mapped == null) throw new InvalidOperationException("第二客户端 MSAA 编辑器未匹配");
         int n = probes + 1;
+        var body = inputForItem(n);
         log("peer-input-write-attempt item=" + n);
-        var result = MsaaProbe.PutValue(mapped, scope.Marker);
+        var result = MsaaProbe.PutValue(mapped, body);
         if (result != 0) throw new InvalidOperationException("第二客户端 MSAA 写入失败，需核对测试草稿");
         for (int attempt = 0; ; attempt++)
         {
@@ -122,7 +132,7 @@ internal sealed class ExternalPeerDriver
                 var current = Scan();
                 return Tuple.Create(current.Draft(), current.EmptyDraft());
             });
-            if (draft.Item1 == scope.Marker) break;
+            if (draft.Item1 == body) break;
             if (!draft.Item2 || attempt >= 4) throw new InvalidOperationException("第二客户端草稿回读不一致");
         }
         log("peer-input-write-confirmed item=" + n);
@@ -138,8 +148,8 @@ internal sealed class ExternalPeerDriver
         guard();
         var safe = Observe(() => {
             var fresh = Scan();
-            return fresh.Draft() == scope.Marker &&
-                sentKeys.SequenceEqual(fresh.ReplyRows().Where(scope.IsInput).Select(row => row.Key));
+            return fresh.Draft() == body &&
+                sentKeys.SequenceEqual(fresh.ReplyRows().Where(IsTestInput).Select(row => row.Key));
         });
         if (!safe)
             throw new InvalidOperationException("第二客户端发送前草稿或消息列表变化");
@@ -153,7 +163,7 @@ internal sealed class ExternalPeerDriver
         {
             if (cancel.WaitHandle.WaitOne(240)) cancel.ThrowIfCancellationRequested();
             var observed = Observe(() => { var current = Scan(); return Tuple.Create(current.ReplyRows(), current.EmptyDraft()); });
-            var rows = observed.Item1.Where(scope.IsInput).ToArray();
+            var rows = observed.Item1.Where(IsTestInput).ToArray();
             var keys = rows.Select(row => row.Key).ToArray();
             if (!NewOccurrence(sentKeys, keys) || rows.Any(row => row.Own != true) || !observed.Item2) continue;
             log("peer-input-local-bubble item=" + n + " exactRows=" + keys.Length + " direction=outgoing bubble=" +

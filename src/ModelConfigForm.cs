@@ -74,6 +74,7 @@ internal sealed class ModelConfigForm : Form
 
     internal static string DisplayError(Exception error)
     {
+        if (error is PrivateRouteLostException) return error.Message;
         var modelError = error as ModelReplyException;
         return modelError == null ? Experiment.Failure(error) : modelError.Message;
     }

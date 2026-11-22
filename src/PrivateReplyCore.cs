@@ -12,6 +12,17 @@ internal interface IPrivateTransport
     void Submit(string text, Action verifyBefore, Action<Action> commit);
 }
 
+internal interface ICheckedPrivateTransport
+{
+    void SubmitChecked(string text, Action<ReplyRow[]> verify, Action<Action, Action> commit, Action<string> checkpoint);
+    ReplyRow[] ReadAfterSubmit(out bool draftEmpty);
+}
+
+internal sealed class PrivateRouteLostException : InvalidOperationException
+{
+    internal PrivateRouteLostException(string detail) : base(detail) { }
+}
+
 internal sealed class ReplyDraft
 {
     internal readonly string Text, RecoveryTag;
@@ -63,12 +74,14 @@ internal sealed class PrivateRunControl : IDisposable
         Check();
         if (capturedRevision != Revision) throw new PrivatePausedException();
     }
-    internal void Commit(int capturedRevision, Action record, Action submit)
+    internal void Commit(int capturedRevision, Action record, Action prepare, Action submit)
     {
         lock (gate)
         {
             Check(capturedRevision);
             record();
+            Check(capturedRevision);
+            prepare();
             Check(capturedRevision);
             submit();
         }
@@ -91,7 +104,10 @@ internal sealed class PrivateReplyCore
     private readonly Predicate<ReplyRow> permitted;
     private readonly Action<string> log;
     private readonly int confirmationMilliseconds;
+    private readonly string bindingVersion;
+    private readonly Stopwatch sessionClock = Stopwatch.StartNew();
     internal bool RecoveryBlocked { get; private set; }
+    internal bool BindingInvalidated { get; private set; }
     internal int OwnIgnored { get; private set; }
 
     internal PrivateReplyCore(PrivateStore store, IPrivateTransport wire, IPrivateReplyProvider provider,
@@ -105,13 +121,15 @@ internal sealed class PrivateReplyCore
         this.log = log;
         this.confirmationMilliseconds = confirmationMilliseconds;
         if (store.State.Binding == null) throw new InvalidOperationException("请先核验并绑定 QQ 私聊");
+        bindingVersion = store.State.Binding.RouteStamp();
     }
 
     internal void RequireRoute(string bot, string peer)
     {
         var proof = store.State.Binding;
-        if (bot != proof.BotQq || peer != proof.PeerQq || wire.Epoch != proof.Epoch)
-            throw new InvalidOperationException("请求账号与已核验的单私聊绑定不符");
+        if (proof == null || bot != proof.BotQq || peer != proof.PeerQq || wire.Epoch != proof.Epoch ||
+            proof.RouteStamp() != bindingVersion)
+            throw new PrivateRouteLostException("请求账号、窗口代际或绑定版本发生变化，请重新核验");
     }
 
     internal void Start(string bot, string peer)
@@ -131,7 +149,8 @@ internal sealed class PrivateReplyCore
         {
             if (item.Phase == PrivatePhase.SubmitIntent || item.Phase == PrivatePhase.Uncertain)
             {
-                var match = !String.IsNullOrEmpty(item.RecoveryTag) && store.State.SnapshotEpoch == wire.Epoch &&
+                var match = !String.IsNullOrEmpty(item.RecoveryTag) &&
+                    (item.BindingVersion == null || item.BindingVersion == bindingVersion) && store.State.SnapshotEpoch == wire.Epoch &&
                     positionMatches != 0 && item.BotQq == bot && item.PeerQq == peer &&
                     current.Any(row => row.Own == false && row.Key == item.RuntimeKey && row.Digest == item.Digest) &&
                     HasReply(current, item);
@@ -139,7 +158,7 @@ internal sealed class PrivateReplyCore
                     match ? "restart-found-unique-outgoing-tag" : "restart-no-reliable-match-no-resend");
                 RecoveryBlocked |= !match;
             }
-            else if (IsUnsubmitted(item))
+            else if (PrivateStore.IsUnsubmitted(item))
                 Change(item, PrivatePhase.Cancelled, "restart-unsubmitted-no-history-replay");
         }
         SaveSnapshot(display);
@@ -153,15 +172,9 @@ internal sealed class PrivateReplyCore
         store.Save();
     }
 
-    private static bool IsUnsubmitted(PrivateEvent item)
-    {
-        return item.Phase == PrivatePhase.Observed || item.Phase == PrivatePhase.Queued ||
-            item.Phase == PrivatePhase.Generated || item.Phase == PrivatePhase.Preparing;
-    }
-
     internal void StopUnsubmitted()
     {
-        foreach (var item in store.State.Events.Where(IsUnsubmitted))
+        foreach (var item in store.State.Events.Where(PrivateStore.IsUnsubmitted))
             Change(item, PrivatePhase.Cancelled, "stop-before-submit");
     }
 
@@ -173,18 +186,41 @@ internal sealed class PrivateReplyCore
 
     internal void Tick()
     {
+        try { TickBound(); }
+        catch (PrivateRouteLostException)
+        {
+            BindingInvalidated = true;
+            control.Pause();
+            foreach (var item in store.State.Events.Where(PrivateStore.IsUnsubmitted))
+                Change(item, PrivatePhase.Cancelled, "binding-invalidated-before-submit");
+            throw;
+        }
+    }
+
+    private void TickBound()
+    {
         control.Token.ThrowIfCancellationRequested();
-        if (control.Paused || RecoveryBlocked) return;
+        if (control.Paused || RecoveryBlocked || BindingInvalidated) return;
+        var current = store.State.Binding;
+        if (current == null) throw new PrivateRouteLostException("原直播绑定已撤销");
+        RequireRoute(current.BotQq, current.PeerQq);
+        var scanning = sessionClock.ElapsedMilliseconds;
         var rows = wire.Read();
-        foreach (var row in timeline.Advance(rows))
+        var readFinished = sessionClock.ElapsedMilliseconds;
+        ReplyRow[] added;
+        try { added = timeline.Advance(rows); }
+        catch (InvalidOperationException) { throw new PrivateRouteLostException("消息列表连续性已丢失，请重新核验原私聊"); }
+        foreach (var row in added)
         {
             if (row.Own == true) { OwnIgnored++; continue; }
             if (row.Own != false || row.Segments != 1 || String.IsNullOrWhiteSpace(row.RawText) || !permitted(row)) continue;
             var proof = store.State.Binding;
             var item = new PrivateEvent {
                 LocalId = Guid.NewGuid().ToString("N"), BotQq = proof.BotQq, PeerQq = proof.PeerQq,
-                ObservedUtc = PrivateStore.Stamp(), RuntimeKey = row.Key, Digest = row.Digest, Body = row.RawText
+                ObservedUtc = PrivateStore.Stamp(), RuntimeKey = row.Key, Digest = row.Digest, Body = row.RawText,
+                BindingVersion = bindingVersion
             };
+            log("timing id=" + item.LocalId + " stage=read-and-discover mono-ms=" + readFinished + " scan-ms=" + (readFinished - scanning));
             store.State.Events = store.State.Events.Concat(new[] { item }).ToArray();
             Change(item, PrivatePhase.Observed, "uia-new-incoming anchor=" + MessageSnapshot.Hash(row.Anchor));
             Change(item, PrivatePhase.Queued, "fixed-route");
@@ -201,13 +237,27 @@ internal sealed class PrivateReplyCore
         control.Check(revision);
         RequireRoute(item.BotQq, item.PeerQq);
         var rows = wire.Read();
-        timeline.CheckSameConversation(rows);
+        VerifyRows(item, revision, checkMatchingReply, rows);
+        return rows;
+    }
+
+    private void VerifyRows(PrivateEvent item, int revision, bool checkMatchingReply, ReplyRow[] rows)
+    {
+        control.Check(revision);
+        RequireRoute(item.BotQq, item.PeerQq);
+        if (item.BindingVersion != bindingVersion) throw new PrivateRouteLostException("任务所属的绑定已经失效");
+        try { timeline.CheckSameConversation(rows); }
+        catch (InvalidOperationException) { throw new PrivateRouteLostException("当前消息列表已失去原会话的连续锚点"); }
         if (!rows.Any(row => row.Key == item.RuntimeKey && row.Digest == item.Digest && row.Own == false))
-            throw new InvalidOperationException("来信锚点不在当前已核验会话");
+            throw new PrivateRouteLostException("来信锚点不在当前已核验会话");
         if (checkMatchingReply && item.RecoveryTag != null && rows.Any(row => row.Text == MessageSnapshot.Normalize(item.Reply)))
             throw new InvalidOperationException("发送前已有相同回复，已暂停");
         control.Check(revision);
-        return rows;
+    }
+
+    private void Timing(PrivateEvent item, string stage)
+    {
+        log("timing id=" + item.LocalId + " stage=" + stage + " mono-ms=" + sessionClock.ElapsedMilliseconds);
     }
 
     private static bool HasReply(ReplyRow[] rows, PrivateEvent item)
@@ -271,12 +321,17 @@ internal sealed class PrivateReplyCore
         int revision = control.Revision;
         try
         {
-            Verify(item, revision, false);
+            // Tick has just verified the live route and observed this turn. Do not take another full snapshot here.
+            control.Check(revision);
+            RequireRoute(item.BotQq, item.PeerQq);
+            Timing(item, "identity-before-model");
             int contextLimit = 0;
             if (item.Phase == PrivatePhase.Queued)
             {
                 generationStarted = true;
+                Timing(item, "provider-start");
                 var draft = Generate(item, revision);
+                Timing(item, "provider-end");
                 control.Check(revision);
                 if (draft == null || String.IsNullOrWhiteSpace(draft.Text) || draft.Text.Length > 2000)
                     throw new InvalidOperationException("回复正文无效或超出长度");
@@ -286,25 +341,37 @@ internal sealed class PrivateReplyCore
                 contextLimit = draft.ModelContextLimit;
                 Change(item, PrivatePhase.Generated, "reply-provider");
             }
-            var before = Verify(item, revision, true);
-            wire.RequireReady();
+            ReplyRow[] before = null;
             Change(item, PrivatePhase.Preparing, "before-editor-write");
-            wire.Submit(item.Reply, () => before = Verify(item, revision, true), submit => control.Commit(revision,
+            var checkedWire = wire as ICheckedPrivateTransport;
+            Action<Action, Action> submitChecked = (prepare, submit) => control.Commit(revision,
                 () => Change(item, PrivatePhase.SubmitIntent, "durable-before-default-action"),
-                () => { crossed = true; submit(); }));
+                prepare, () => { crossed = true; Timing(item, "submit"); submit(); });
+            if (checkedWire != null)
+                checkedWire.SubmitChecked(item.Reply, rows => { VerifyRows(item, revision, true, rows); before = rows; },
+                    submitChecked, checkpoint => Timing(item, checkpoint));
+            else
+            {
+                before = Verify(item, revision, true);
+                wire.RequireReady();
+                wire.Submit(item.Reply, () => before = Verify(item, revision, true), submit => submitChecked(() => { }, submit));
+            }
             var until = System.Diagnostics.Stopwatch.StartNew();
             do
             {
-                var rows = wire.Read();
-                timeline.CheckSameConversation(rows);
-                if (HasNewReply(before, rows, item))
+                bool draftEmpty = true;
+                var rows = checkedWire == null ? wire.Read() : checkedWire.ReadAfterSubmit(out draftEmpty);
+                try { timeline.CheckSameConversation(rows); }
+                catch (InvalidOperationException) { throw new PrivateRouteLostException("提交后原会话锚点消失，发送结果待确认"); }
+                if (HasNewReply(before, rows, item) && draftEmpty)
                 {
-                    wire.RequireReady();
+                    if (checkedWire == null) wire.RequireReady();
                     if (contextLimit > 0)
                         store.State.ModelTurns = ModelReplyContext.Recent(store.State.ModelTurns.Concat(new[] {
                             new PrivateModelTurn { User = item.Body, Assistant = item.Reply }
                         }), contextLimit).ToArray();
                     Change(item, PrivatePhase.LocalConfirmed, "unique-new-outgoing-bubble-and-empty-draft");
+                    Timing(item, "local-confirm");
                     return;
                 }
                 Wait(230);

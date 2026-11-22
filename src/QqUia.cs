@@ -24,12 +24,14 @@ internal sealed class Controls
         object value;
         return el != null && el.TryGetCurrentPattern(pattern, out value) ? value as T : null;
     }
-    internal static Controls Scan(Target target)
+    internal static Controls Scan(Target target, bool fast = false)
     {
         if (!target.SameWindow()) throw new InvalidOperationException("目标窗口失效");
-        var best = Discover(AutomationElement.FromHandle(target.Hwnd), "HWND");
+        var best = Discover(AutomationElement.FromHandle(target.Hwnd), "HWND", fast);
         // Some QQ builds expose the Chromium tree only from the renderer HWND.
-        if (best.Header != null && best.Value != null && best.HasMessageArea) return best;
+        if (best.Header != null && best.HasMessageArea &&
+            (fast ? best.Button != null && best.Editor != null && best.History != null && best.Bubbles.Count != 0 :
+                best.Value != null)) return best;
         var renderers = new List<IntPtr>();
         Native.EnumChildWindows(target.Hwnd, (h, d) => {
             if (Native.Class(h) == "Chrome_RenderWidgetHostHWND" && Native.Visible(h)) renderers.Add(h);
@@ -37,7 +39,7 @@ internal sealed class Controls
         }, IntPtr.Zero);
         foreach (var hwnd in renderers)
         {
-            var alternate = Discover(AutomationElement.FromHandle(hwnd), "renderer");
+            var alternate = Discover(AutomationElement.FromHandle(hwnd), "renderer", fast);
             if (alternate.Score > best.Score) best = alternate;
         }
         return best;
@@ -72,16 +74,26 @@ internal sealed class Controls
             foreach (var child in RawDescendants(node, depth - 1)) yield return child;
         }
     }
-    private static Controls Discover(AutomationElement root, string source)
+    private static AutomationElement[] WithStructure(AutomationElement root, bool fast)
     {
-        var elements = Nodes(root, TreeScope.Descendants, Condition.TrueCondition);
+        if (!fast) return Nodes(root, TreeScope.Descendants, Condition.TrueCondition);
+        var batch = new CacheRequest();
+        batch.Add(AutomationElement.ClassNameProperty);
+        batch.Add(AutomationElement.AutomationIdProperty);
+        using (batch.Activate()) return Nodes(root, TreeScope.Descendants, Condition.TrueCondition);
+    }
+    private static Controls Discover(AutomationElement root, string source, bool fast)
+    {
+        var elements = WithStructure(root, fast);
+        Func<AutomationElement, string> classes = e => fast ? e.Cached.ClassName : e.Current.ClassName;
+        Func<AutomationElement, string, bool> hasClass = (e, name) => classes(e).Split(' ').Contains(name);
         var result = new Controls { Source = source, NodeCount = elements.Length, origin = root };
-        result.Header = Unique(elements.Where(e => HasClass(e, "chat-header__contact-name")));
-        result.Editor = Unique(elements.Where(e => HasClass(e, "qq-msg-editor")));
+        result.Header = Unique(elements.Where(e => hasClass(e, "chat-header__contact-name")));
+        result.Editor = Unique(elements.Where(e => hasClass(e, "qq-msg-editor")));
         result.EditorContainer = result.Editor;
         if (result.Editor == null)
         {
-            var input = Unique(elements.Where(e => HasClass(e, "msg-input")));
+            var input = Unique(elements.Where(e => hasClass(e, "msg-input")));
             if (input != null)
             {
                 result.EditorContainer = input;
@@ -102,11 +114,12 @@ internal sealed class Controls
             Is(AutomationElement.ControlTypeProperty, ControlType.Button),
             new OrCondition(Is(AutomationElement.NameProperty, "发送"), Is(AutomationElement.NameProperty, "Send")))));
         result.History = Unique(elements.Where(e =>
-            e.Current.AutomationId == "ml-root" || HasClass(e, "ml-root") || HasClass(e, "message-list")));
-        var historyNodes = result.History == null ? elements : Nodes(result.History, TreeScope.Descendants, Condition.TrueCondition);
-        result.Bubbles = historyNodes.Where(e => HasClass(e, "msg-content-container")).ToList();
+            (fast ? e.Cached.AutomationId : e.Current.AutomationId) == "ml-root" ||
+            hasClass(e, "ml-root") || hasClass(e, "message-list")));
+        var historyNodes = result.History == null ? elements : WithStructure(result.History, fast);
+        result.Bubbles = historyNodes.Where(e => hasClass(e, "msg-content-container")).ToList();
         if (result.Bubbles.Count == 0)
-            result.Bubbles = historyNodes.Where(e => HasClass(e, "message-container")).ToList();
+            result.Bubbles = historyNodes.Where(e => hasClass(e, "message-container")).ToList();
         if (result.Bubbles.Count == 0 && result.History != null)
         {
             var rawRows = RawDescendants(result.History, 4).Take(450).ToArray();
@@ -114,7 +127,7 @@ internal sealed class Controls
             if (result.Bubbles.Count == 0)
                 result.Bubbles = rawRows.Where(e => HasClass(e, "message-container")).ToList();
         }
-        result.Shapes = String.Join(",", elements.Select(e => e.Current.ClassName)
+        result.Shapes = fast ? "" : String.Join(",", elements.Select(classes)
             .SelectMany(s => s.Split(' '))
             .Where(s => Regex.IsMatch(s, "^(chat-header|qq-msg|msg-|message-|ml-root)[a-z_0-9-]*$"))
             .Distinct().Take(28));
@@ -437,11 +450,11 @@ internal sealed class Binding
     internal readonly bool Self;
     internal string HeaderProof { get { return MessageSnapshot.Hash(header + "\n" + String.Join(".", headerId)); } }
     // The operator verifies QQ numbers locally. The program stores no account number.
-    internal Binding(Target target, bool self)
+    internal Binding(Target target, bool self, bool fast = false)
     {
         Target = target;
         Self = self;
-        var controls = Controls.Scan(target);
+        var controls = Controls.Scan(target, fast);
         header = controls.HeaderIdentity();
         if (String.IsNullOrWhiteSpace(header))
             throw new InvalidOperationException("此窗口没有唯一的 QQ 会话头。请打开独立聊天窗口。");
@@ -452,9 +465,9 @@ internal sealed class Binding
         return Target.SameWindow() && Native.Title(Target.Hwnd) == Target.Title && controls.HeaderIdentity() == header &&
             controls.Header.GetRuntimeId().SequenceEqual(headerId);
     }
-    internal Controls RequireMatch()
+    internal Controls RequireMatch(bool fast = false)
     {
-        var controls = Controls.Scan(Target);
+        var controls = Controls.Scan(Target, fast);
         if (!Matches(controls)) throw new InvalidOperationException("当前会话无法复核");
         return controls;
     }

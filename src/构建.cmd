@@ -38,6 +38,10 @@ if not "%errorlevel%"=="0" goto failure
 if errorlevel 1 goto failure
 "%OUT%\ModelChecks.exe"
 if not "%errorlevel%"=="0" goto failure
+"%NET%\csc.exe" /nologo /codepage:65001 /target:exe /main:RouteChecks /out:"%OUT%\RouteChecks.exe" /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:Accessibility.dll /r:System.Security.dll /r:System.Net.Http.dll /r:System.Runtime.Serialization.dll /r:"%NET%\WPF\WindowsBase.dll" /r:"%NET%\WPF\UIAutomationClient.dll" /r:"%NET%\WPF\UIAutomationTypes.dll" *.cs "tests\RouteChecks.cs"
+if errorlevel 1 goto failure
+"%OUT%\RouteChecks.exe"
+if not "%errorlevel%"=="0" goto failure
 popd
 exit /b 0
 

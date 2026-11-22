@@ -17,6 +17,9 @@ internal sealed class PrivateLiveCheck : Form
     private readonly PrivateRunControl control = new PrivateRunControl();
     private string logFile;
     private readonly object logGate = new object();
+    private readonly QqPlacement placement = new QqPlacement();
+    private PrivateBindingProof movedBinding;
+    private Rectangle beforeMove;
     private bool finished;
 
     internal PrivateLiveCheck(string settings)
@@ -46,8 +49,8 @@ internal sealed class PrivateLiveCheck : Form
         {
             var s = File.ReadAllLines(settings, Encoding.UTF8);
             if (s.Length < 8 || !Regex.IsMatch(s[6], "^[A-F0-9]{12}$") ||
-                !new[] { "send", "restart", "recover", "cleanup", "send-model-mock" }.Contains(s[7]) ||
-                s.Length != (s[7] == "send-model-mock" ? 9 : 8))
+                !new[] { "send", "send-side", "restart", "restart-real", "recover", "cleanup", "send-model-mock", "send-model-real" }.Contains(s[7]) ||
+                s.Length != (s[7] == "send-model-mock" || s[7] == "send-model-real" ? 9 : 8))
                 throw new InvalidOperationException("真机验证配置无效");
             if (s[7] == "send-model-mock")
             {
@@ -59,7 +62,7 @@ internal sealed class PrivateLiveCheck : Form
             Directory.CreateDirectory(output);
             logFile = Path.Combine(output, "live-" + s[6] + "-" + s[7] + ".log");
             using (File.Open(logFile, FileMode.CreateNew)) { }
-            var isRestart = s[7] != "send" && s[7] != "send-model-mock";
+            var isRestart = !s[7].StartsWith("send", StringComparison.Ordinal);
             PrivateBindingProof proof;
             using (var store = new PrivateStore(output))
             {
@@ -97,6 +100,17 @@ internal sealed class PrivateLiveCheck : Form
             }
             await PrepareEditor(Target.FromKnownHandle(Int64.Parse(s[2])), s[3], s[4], "peer");
             await PrepareEditor(target, proof.PeerDisplay, proof.HeaderProof, "bot");
+            if (s[7] == "send-side" || s[7] == "send-model-real")
+            {
+                await Task.Run(() => QqConnection.VerifyUnique(proof, control.Token.ThrowIfCancellationRequested, Log), control.Token);
+                beforeMove = Native.Bounds(target.Hwnd);
+                placement.Side(target);
+                movedBinding = proof;
+                await Task.Delay(350, control.Token);
+                await Task.Run(() => QqConnection.VerifyUnique(proof, control.Token.ThrowIfCancellationRequested, Log), control.Token);
+                Log("layout side applied and identity checked before=" + beforeMove + " after=" + Native.Bounds(target.Hwnd) +
+                    " size-preserved=" + (beforeMove.Size == Native.Bounds(target.Hwnd).Size) + " measurement-not-started");
+            }
             var outer = Native.Bounds(target.Hwnd);
             var work = Screen.FromHandle(target.Hwnd).WorkingArea;
             const int width = 285;
@@ -104,6 +118,7 @@ internal sealed class PrivateLiveCheck : Form
             if (x < work.Left) x = outer.Right;
             if (x + width > work.Right) throw new InvalidOperationException("目标旁边没有专用便笺空间");
             Bounds = new Rectangle(x, work.Top + 215, width, 64);
+            if (Native.GetForegroundWindow() != Handle) Activate(); // test-owned control, before measurement
             using (var cover = new Cover())
             using (var pad = new TypingPad(new Rectangle(x, work.Top + 20, width, 175), automaticMarker: s[6]))
             {
@@ -149,18 +164,62 @@ internal sealed class PrivateLiveCheck : Form
             }
             Log("restored cover=closed pad=closed qq-geometry-unchanged=" + (outer == Native.Bounds(target.Hwnd)));
         }
-        catch (Exception ex) { if (logFile != null && File.Exists(logFile)) Log("halt " + Experiment.Failure(ex)); }
-        finally { finished = true; Close(); }
+        catch (Exception ex) { if (logFile != null && File.Exists(logFile)) Log("halt " + ModelConfigForm.DisplayError(ex)); }
+        finally
+        {
+            if (movedBinding != null)
+            {
+                try
+                {
+                    var target = QqConnection.Pinned(movedBinding);
+                    QqPlacement.Show(target);
+                    Thread.Sleep(230);
+                    Log("layout shown identity hwnd=" + Task.Run(() => QqConnection.VerifyUnique(movedBinding, () => { }, Log)).GetAwaiter().GetResult());
+                    if (placement.Restore())
+                    {
+                        Thread.Sleep(230);
+                        Log("layout restored exact=" + (Native.Bounds(target.Hwnd) == beforeMove) + " identity hwnd=" +
+                            Task.Run(() => QqConnection.VerifyUnique(movedBinding, () => { }, Log)).GetAwaiter().GetResult());
+                    }
+                }
+                catch (Exception ex)
+                {
+                    try { placement.Restore(); } catch (Exception) { }
+                    Log("layout restoration check halted " + ModelConfigForm.DisplayError(ex));
+                }
+            }
+            finished = true;
+            Close();
+        }
     }
 
     private async Task PrepareEditor(Target target, string display, string header, string endpoint)
     {
         var available = await Task.Run(() => {
-            var b = new Binding(target, false);
-            var ui = b.RequireMatch();
-            if (b.HeaderProof != header || ui.HeaderIdentity() != display || !ui.EmptyDraft() || ui.HasVisibleConnectionWarning())
-                throw new InvalidOperationException("测试准备阶段无法核验 " + endpoint + " 会话及空草稿");
-            return MsaaProbe.FindMappedEditor(target, ui, Log) != null;
+            for (int attempt = 0; ; attempt++)
+            {
+                control.Token.ThrowIfCancellationRequested();
+                try
+                {
+                    var b = new Binding(target, false, true);
+                    var ui = b.RequireMatch();
+                    if (b.HeaderProof != header || ui.HeaderIdentity() != display || !ui.EmptyDraft() || ui.HasVisibleConnectionWarning())
+                        throw new InvalidOperationException("测试准备阶段无法核验 " + endpoint + " 会话及空草稿");
+                    return MsaaProbe.FindMappedEditor(target, ui, Log) != null;
+                }
+                catch (ElementNotAvailableException)
+                {
+                    if (attempt == 2) throw;
+                    Log("setup " + endpoint + " transient UIA node: retry read only");
+                    Thread.Sleep(250);
+                }
+                catch (System.Runtime.InteropServices.COMException ex)
+                {
+                    if (attempt == 2) throw;
+                    Log("setup " + endpoint + " COM read retry only hr=0x" + ex.HResult.ToString("X8"));
+                    Thread.Sleep(250);
+                }
+            }
         }, control.Token);
         if (available)
         {
@@ -208,9 +267,11 @@ internal sealed class PrivateLiveCheck : Form
 
     private void Verify(string[] s, string output, bool restart, PrivateBindingProof proof, Target target, Action guard)
     {
+        var realModel = s[7] == "send-model-real" || s[7] == "restart-real";
         using (var store = new PrivateStore(output))
         using (var transport = new QqPrivateTransport(proof, guard, Log))
-        using (var mock = s[7] == "send-model-mock" ? new DeepSeekPrivateReply(new PrivateModelSettings {
+        using (var model = s[7] == "send-model-real" ? new DeepSeekPrivateReply(ModelSettingsFile.Load(s[8]), () => store.State.ModelTurns, Log) :
+            s[7] == "send-model-mock" ? new DeepSeekPrivateReply(new PrivateModelSettings {
             Endpoint = s[8], Model = "mock-qq", ApiKey = "test-only-placeholder-never-real",
             TimeoutSeconds = 8, ContextTurns = 2, RolePrompt = "Use short answers."
         }, () => store.State.ModelTurns, Log) : null)
@@ -222,9 +283,14 @@ internal sealed class PrivateLiveCheck : Form
             }
             var scope = new ExternalPrivateScope(new[] { proof.Window.ToString(), s[6], "F", proof.BotQq, proof.PeerQq,
                 proof.PeerDisplay, "operator-verified-private-by-qq-number", s[2], s[3] });
-            IPrivateReplyProvider provider = mock == null ? (IPrivateReplyProvider)new FixedPrivateReply(item => "核心验证 " + s[6] + " 已收到") : mock;
+            IPrivateReplyProvider provider = model == null ? (IPrivateReplyProvider)new FixedPrivateReply(item => "核心验证 " + s[6] + " 已收到") : model;
             IPrivateTransport selected = restart ? (IPrivateTransport)new ReadOnlyTransport(transport) : transport;
-            var core = new PrivateReplyCore(store, selected, provider, control, row => scope.IsInput(row), Log);
+            Func<int, string> prompts = number => number == 1 ?
+                "请记住暗号「梅雨36」，只回复「记住了」。编号" + s[6] :
+                "刚才的暗号是什么？只回复暗号。编号" + s[6];
+            var core = new PrivateReplyCore(store, selected, provider, control,
+                row => realModel ? row.Text == MessageSnapshot.Normalize(prompts(1)) ||
+                    row.Text == MessageSnapshot.Normalize(prompts(2)) : scope.IsInput(row), Log);
             var recovering = s[7] == "recover";
             if (restart && !recovering &&
                 (store.State.Events.Length != 2 || store.State.Events.Any(x => x.Phase != PrivatePhase.LocalConfirmed)))
@@ -232,7 +298,8 @@ internal sealed class PrivateLiveCheck : Form
             if (recovering && (store.State.Events.Length != 1 || store.State.Events[0].Phase != PrivatePhase.Uncertain))
                 throw new InvalidOperationException("缺少待确认的单条真机事件");
             var driver = restart ? null : new ExternalPeerDriver(scope, target, Log, control.Token,
-                number => store.State.Events[number - 1].Reply, expectedHeaderProof: s[4]);
+                number => store.State.Events[number - 1].Reply, expectedHeaderProof: s[4],
+                inputForItem: realModel ? prompts : null);
             core.Start(proof.BotQq, proof.PeerQq);
             Log("baseline READY probe=" + scope.Marker);
             if (recovering)
@@ -268,15 +335,20 @@ internal sealed class PrivateLiveCheck : Form
                 {
                     var events = store.State.Events;
                     if (driver.Receipts != 2 || core.OwnIgnored != 2 || events.Length != 2 ||
-                        events.Any(x => x.Phase != PrivatePhase.LocalConfirmed) || events[0].Digest != events[1].Digest ||
+                        events.Any(x => x.Phase != PrivatePhase.LocalConfirmed) || (!realModel && events[0].Digest != events[1].Digest) ||
                         events[0].RuntimeKey == events[1].RuntimeKey || events[0].LocalId == events[1].LocalId)
                         throw new InvalidOperationException("没有满足双端确认、本人过滤与同文去重");
-                    if (mock != null && (store.State.ModelTurns.Length != 2 || events.Any(item => item.RecoveryTag != null) ||
+                    if (realModel)
+                    {
+                        bool context = store.State.ModelTurns.Length == 2 && events[1].Reply.Trim(' ', '。', '.', '「', '」') == "梅雨36";
+                        Log("real-model context-expected=" + context + " context-turns=" + store.State.ModelTurns.Length);
+                    }
+                    else if (model != null && (store.State.ModelTurns.Length != 2 || events.Any(item => item.RecoveryTag != null) ||
                         events[0].Reply != "模拟首轮确认 " + s[6] ||
                         events[1].Reply != "模拟第二轮，已带入上一轮 " + s[6]))
                         throw new InvalidOperationException("模型回执或已确认上下文不符");
-                    Log("PASS same-body-different-occurrences incoming=2 confirmed=2 peer=2 own-filtered=2" +
-                        (mock == null ? "" : " model=mock-http context-turns=2"));
+                    Log("PASS incoming=2 confirmed=2 peer=2 own-filtered=2" +
+                        (realModel ? " model=real" : model == null ? " model=fixed" : " model=mock-http context-turns=2"));
                 }
             }
             finally { core.StopUnsubmitted(); }

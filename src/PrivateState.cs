@@ -13,12 +13,20 @@ public enum PrivatePhase
 public sealed class PrivateBindingProof
 {
     public string BotQq, PeerQq, BotDisplay, PeerDisplay, HeaderProof, LoginProof, Epoch, ChallengeAnchor, VerifiedUtc;
+    public string Version;
     public long Window;
+
+    internal string RouteStamp()
+    {
+        return MessageSnapshot.Hash(String.Join("\n", new[] { Version, BotQq, PeerQq, BotDisplay, PeerDisplay,
+            HeaderProof, LoginProof, Epoch, ChallengeAnchor, VerifiedUtc, Window.ToString() }));
+    }
 }
 
 public sealed class PrivateEvent
 {
     public string LocalId, BotQq, PeerQq, ObservedUtc, RuntimeKey, Digest, Body, Reply, RecoveryTag, Detail;
+    public string BindingVersion;
     public PrivatePhase Phase;
 }
 
@@ -93,6 +101,26 @@ internal sealed class PrivateStore : IDisposable
     {
         item.Phase = phase;
         item.Detail = detail;
+        Save();
+    }
+
+    internal static bool IsUnsubmitted(PrivateEvent item)
+    {
+        return item.Phase == PrivatePhase.Observed || item.Phase == PrivatePhase.Queued ||
+            item.Phase == PrivatePhase.Generated || item.Phase == PrivatePhase.Preparing;
+    }
+
+    internal void ReplaceBinding(PrivateBindingProof verified)
+    {
+        var prior = State.Binding;
+        if (verified == null || (prior != null && (prior.BotQq != verified.BotQq || prior.PeerQq != verified.PeerQq)))
+            throw new InvalidOperationException("不允许把已保存任务改绑到其他 QQ 账号");
+        foreach (var pending in State.Events.Where(IsUnsubmitted))
+        {
+            pending.Phase = PrivatePhase.Cancelled;
+            pending.Detail = "binding-replaced-before-submit";
+        }
+        State.Binding = verified;
         Save();
     }
 

@@ -18,18 +18,26 @@ internal sealed class PrivateCoreForm : Form
     private readonly Button stop = new Button { Text = "停止", AutoSize = true };
     private readonly Button configure = new Button { Text = "模型设置", AutoSize = true };
     private readonly Button clearContext = new Button { Text = "清空上下文", AutoSize = true };
+    private readonly Button findQq = new Button { Text = "连接 QQ", AutoSize = true };
+    private readonly Button pickQq = new Button { Text = "选择窗口／手动核验", AutoSize = true };
+    private readonly Button showQq = new Button { Text = "显示 QQ", AutoSize = true };
+    private readonly Button sideQq = new Button { Text = "侧边摆放", AutoSize = true };
+    private readonly Button restoreQq = new Button { Text = "恢复原位置", AutoSize = true };
+    private readonly QqPlacement placement = new QqPlacement();
+    private readonly NotifyIcon tray = new NotifyIcon { Icon = SystemIcons.Application, Text = "QQ 单私聊回复" };
     private readonly ComboBox mode = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 95 };
     private readonly object logGate = new object();
     private PrivateRunControl run;
     private CancellationTokenSource enrollment;
     private bool closePending;
+    private bool connecting;
 
     internal PrivateCoreForm(string folder)
     {
         this.folder = folder;
         Text = "QQ 自动回复 · 单私聊 AI";
-        ClientSize = new Size(605, 432);
-        MinimumSize = new Size(590, 446);
+        ClientSize = new Size(655, 466);
+        MinimumSize = new Size(620, 480);
         StartPosition = FormStartPosition.CenterScreen;
         var grid = new TableLayoutPanel { Dock = DockStyle.Top, Height = 214, Padding = new Padding(8),
             ColumnCount = 2, RowCount = 6, GrowStyle = TableLayoutPanelGrowStyle.FixedSize };
@@ -37,7 +45,7 @@ internal sealed class PrivateCoreForm : Form
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 60));
         for (int row = 0; row < 6; row++) grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
         var labels = new[] { "机器人登录 QQ 号", "允许回复的对象 QQ 号", "机器人的登录显示名",
-            "私聊会话显示名", "QQ 窗口句柄（十进制）" };
+            "私聊会话显示名", "窗口句柄（高级）" };
         for (int i = 0; i < labels.Length; i++)
         {
             grid.Controls.Add(new Label { Text = labels[i], Anchor = AnchorStyles.Left, AutoSize = true }, 0, i);
@@ -51,12 +59,16 @@ internal sealed class PrivateCoreForm : Form
         mode.Items.AddRange(new[] { "固定回复", "模型回复" });
         mode.SelectedIndex = 0;
         buttons.Controls.AddRange(new Control[] { bind, mode, start, pause, stop, configure, clearContext });
+        var location = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 38, Padding = new Padding(6, 4, 6, 0) };
+        location.Controls.AddRange(new Control[] { findQq, pickQq, showQq, sideQq, restoreQq });
         Controls.Add(status);
         Controls.Add(buttons);
+        Controls.Add(location);
         Controls.Add(grid);
         status.Text = "未启动。请先核验绑定。";
         try
         {
+            PrivateProfile.Migrate(folder);
             using (var store = new PrivateStore(folder))
             {
                 var p = store.State.Binding;
@@ -69,6 +81,21 @@ internal sealed class PrivateCoreForm : Form
             }
         }
         catch (Exception ex) { status.Text = "状态不可读取 · " + Experiment.Failure(ex); }
+        findQq.Click += async (s, e) => await LocateQq();
+        pickQq.Click += (s, e) => SelectCandidate();
+        showQq.Click += async (s, e) => await ArrangeQq("show");
+        sideQq.Click += async (s, e) => await ArrangeQq("side");
+        restoreQq.Click += async (s, e) => await ArrangeQq("restore");
+        var menu = new ContextMenuStrip();
+        menu.Items.Add("显示控制窗", null, (s, e) => ShowControl());
+        menu.Items.Add("停止自动回复", null, (s, e) => RequestStop());
+        tray.ContextMenuStrip = menu;
+        tray.DoubleClick += (s, e) => ShowControl();
+        Resize += (s, e) => {
+            if (WindowState != FormWindowState.Minimized) return;
+            tray.Visible = true;
+            Hide();
+        };
         bind.Click += async (s, e) => await Enroll();
         configure.Click += (s, e) => { using (var dialog = new ModelConfigForm(ModelPath, Log)) dialog.ShowDialog(this); };
         clearContext.Click += (s, e) => {
@@ -93,10 +120,102 @@ internal sealed class PrivateCoreForm : Form
         };
         stop.Click += (s, e) => RequestStop();
         FormClosing += (s, e) => {
-            if (run == null && enrollment == null) return;
+            if (!connecting && run == null && enrollment == null) return;
             e.Cancel = true; closePending = true; RequestStop();
         };
+        FormClosed += (s, e) => {
+            try { if (placement.Restore()) Log("layout restored at close"); }
+            catch (Exception ex) { Log("layout restore failed " + ModelConfigForm.DisplayError(ex)); }
+            tray.Dispose();
+            menu.Dispose();
+        };
         UpdateButtons();
+    }
+
+    private void ShowControl()
+    {
+        Show();
+        WindowState = FormWindowState.Normal;
+        tray.Visible = false;
+        Activate();
+    }
+
+    private PrivateBindingProof SavedBinding()
+    {
+        using (var store = new PrivateStore(folder)) return store.State.Binding;
+    }
+
+    private async Task LocateQq()
+    {
+        connecting = true;
+        UpdateButtons();
+        status.Text = "正在查找官方 QQ 和已核验私聊…";
+        try
+        {
+            var proof = SavedBinding();
+            var hwnd = await Task.Run(() => {
+                if (QqConnection.LaunchIfNotRunning()) return 0L;
+                return QqConnection.VerifyUnique(proof, () => { }, Log);
+            });
+            if (hwnd == 0) { status.Text = "已启动 QQ。请完成登录或验证并打开原私聊，再点连接 QQ。"; return; }
+            var values = new[] { proof.BotQq, proof.PeerQq, proof.BotDisplay, proof.PeerDisplay, hwnd.ToString() };
+            for (int i = 0; i < values.Length; i++) fields[i].Text = values[i];
+            status.Text = "已找到唯一的原核验会话。请选择回复模式并点击启动。";
+        }
+        catch (Exception ex) { status.Text = "未自动绑定 · " + ModelConfigForm.DisplayError(ex) +
+            "\r\n请打开 QQ 中的原私聊。必要时选择窗口并重新核验。"; }
+        finally { connecting = false; Finished(); }
+    }
+
+    private void SelectCandidate()
+    {
+        var list = Target.List();
+        if (list.Count == 0) { status.Text = "未发现可选择的 QQ 窗口。请登录或展开 QQ。"; return; }
+        using (var dialog = new Form { Text = "选择 QQ 窗口", Width = 550, Height = 260, StartPosition = FormStartPosition.CenterParent })
+        {
+            var picker = new ListBox { Dock = DockStyle.Fill };
+            foreach (var candidate in list)
+                picker.Items.Add("句柄 " + candidate.Hwnd.ToInt64() + "   PID " + candidate.Pid +
+                    (Native.IsIconic(candidate.Hwnd) ? "   最小化" : "   已展开"));
+            var ok = new Button { Dock = DockStyle.Bottom, Text = "使用此句柄，继续核验", DialogResult = DialogResult.OK };
+            dialog.Controls.Add(picker);
+            dialog.Controls.Add(ok);
+            dialog.AcceptButton = ok;
+            if (dialog.ShowDialog(this) != DialogResult.OK || picker.SelectedIndex < 0) return;
+            fields[4].Text = list[picker.SelectedIndex].Hwnd.ToInt64().ToString();
+            attested.Checked = false;
+            status.Text = "已填写窗口句柄。请核对两端资料卡、打开原私聊，再点核验并绑定。";
+        }
+    }
+
+    private async Task ArrangeQq(string command)
+    {
+        connecting = true;
+        UpdateButtons();
+        try
+        {
+            var proof = SavedBinding();
+            var result = await Task.Run(() => {
+                if (command == "restore" && !placement.Restore()) return "没有待恢复的摆放记录。";
+                if (command == "show") QqPlacement.Show(QqConnection.Pinned(proof));
+                if (command == "side")
+                {
+                    QqConnection.VerifyUnique(proof, () => { }, Log);
+                    placement.Side(QqConnection.Pinned(proof));
+                }
+                Log("layout " + command + " applied; running=no");
+                try { QqConnection.VerifyUnique(proof, () => { }, Log); }
+                catch
+                {
+                    if (command == "side") placement.Restore();
+                    throw;
+                }
+                return "窗口已整理，原绑定复核通过。";
+            });
+            status.Text = result;
+        }
+        catch (Exception ex) { status.Text = "窗口检查未通过 · " + ModelConfigForm.DisplayError(ex); }
+        finally { connecting = false; Finished(); }
     }
 
     private static string Summary(PrivateStore store, string head)
@@ -109,9 +228,10 @@ internal sealed class PrivateCoreForm : Form
     private string ModelPath { get { return Path.Combine(folder, "model-settings.dpapi"); } }
     private void UpdateButtons()
     {
-        var idle = run == null && enrollment == null;
+        var idle = run == null && enrollment == null && !connecting;
         bind.Enabled = start.Enabled = attested.Enabled = configure.Enabled = clearContext.Enabled = mode.Enabled = idle;
         foreach (var field in fields) field.Enabled = idle;
+        findQq.Enabled = pickQq.Enabled = showQq.Enabled = sideQq.Enabled = restoreQq.Enabled = idle;
         pause.Enabled = run != null && !run.Token.IsCancellationRequested;
         stop.Enabled = !idle;
     }
@@ -163,13 +283,13 @@ internal sealed class PrivateCoreForm : Form
                         if (prior != null && (prior.BotQq != a[0] || prior.PeerQq != a[1]))
                             throw new InvalidOperationException("此状态目录只允许原核验账号对");
                         var marker = "QQ验证绑定 " + Guid.NewGuid().ToString("N").Substring(0, 12).ToUpperInvariant();
-                        store.State.Binding = QqPrivateTransport.Enroll(window, a[0], a[1], a[2], a[3],
+                        var verified = QqPrivateTransport.Enroll(window, a[0], a[1], a[2], a[3],
                             marker, pending.Token, text => {
                                 Log(text);
                                 if (text == "enrollment baseline established") Report("请由已核对的对象发送 " + marker);
                             });
                         pending.Token.ThrowIfCancellationRequested();
-                        store.Save();
+                        store.ReplaceBinding(verified);
                         Log("enrollment complete");
                     }
                 });
@@ -186,24 +306,30 @@ internal sealed class PrivateCoreForm : Form
         var local = fields[0].Text.Trim();
         var other = fields[1].Text.Trim();
         var useModel = mode.SelectedIndex == 1;
+        long window;
+        if (!Int64.TryParse(fields[4].Text.Trim(), out window))
+        {
+            status.Text = "请先连接并复核已保存的 QQ 窗口。";
+            return;
+        }
         using (var active = new PrivateRunControl())
         {
             run = active;
             pause.Text = "暂停";
             status.Text = "复核绑定和启动基线…";
             UpdateButtons();
-            try { status.Text = await Task.Run(() => Watch(local, other, useModel, active)); }
+            try { status.Text = await Task.Run(() => Watch(local, other, window, useModel, active)); }
             catch (OperationCanceledException) { status.Text = "已停止"; }
             catch (Exception ex) { status.Text = "停止 · " + ModelConfigForm.DisplayError(ex); }
             finally { run = null; Finished(); }
         }
     }
-    private string Watch(string local, string other, bool useModel, PrivateRunControl active)
+    private string Watch(string local, string other, long window, bool useModel, PrivateRunControl active)
     {
         using (var store = new PrivateStore(folder))
         {
             var proof = store.State.Binding;
-            if (proof == null || proof.BotQq != local || proof.PeerQq != other)
+            if (proof == null || proof.BotQq != local || proof.PeerQq != other || proof.Window != window)
                 throw new InvalidOperationException("尚无这两个号码的已核验绑定");
             using (var modelReply = useModel ? new DeepSeekPrivateReply(ModelSettingsFile.Load(ModelPath),
                 () => store.State.ModelTurns, Log) : null)
@@ -226,6 +352,7 @@ internal sealed class PrivateCoreForm : Form
                             var reason = ModelConfigForm.DisplayError(ex);
                             Log("halt " + reason);
                             if (core.RecoveryBlocked) return Summary(store, "提交结果待确认 · " + reason);
+                            if (core.BindingInvalidated) return Summary(store, "旧绑定的未提交任务已取消 · " + reason);
                             active.Pause();
                             Report(Summary(store, "已暂停 · " + reason));
                         }
