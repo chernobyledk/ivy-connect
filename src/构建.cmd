@@ -26,6 +26,17 @@ if errorlevel 1 goto failure
 if not exist "%OUT%\assets\." mkdir "%OUT%\assets" || goto failure
 copy /y "%~dp0assets\cover.jpg" "%OUT%\assets\cover.jpg" > nul
 if errorlevel 1 goto failure
+"%NET%\csc.exe" /nologo /codepage:65001 /target:winexe /win32icon:"assets\launcher.ico" /out:"%OUT%\启动器.exe" /r:System.Windows.Forms.dll "launcher\Program.cs" "PackageInfo.cs"
+if errorlevel 1 goto failure
+copy /y "%~dp0App.config" "%OUT%\启动器.exe.config" > nul
+if errorlevel 1 goto failure
+if not exist "%OUT%\当前版本\assets\." mkdir "%OUT%\当前版本\assets" || goto failure
+copy /y "%OUT%\Ivy connect.exe" "%OUT%\当前版本\Ivy connect.exe" > nul
+if errorlevel 1 goto failure
+copy /y "%OUT%\Ivy connect.exe.config" "%OUT%\当前版本\Ivy connect.exe.config" > nul
+if errorlevel 1 goto failure
+copy /y "%OUT%\assets\cover.jpg" "%OUT%\当前版本\assets\cover.jpg" > nul
+if errorlevel 1 goto failure
 popd
 exit /b 0
 

@@ -56,8 +56,10 @@ internal sealed class DeepSeekPrivateReply : IPrivateReplyProvider, IDisposable
     {
         [DataMember(Name = "model")] internal string Model;
         [DataMember(Name = "stream")] internal bool Stream = false;
-        [DataMember(Name = "max_tokens")] internal int MaxTokens = 700;
-        [DataMember(Name = "thinking")] internal Thinking ThinkingMode = new Thinking();
+        [DataMember(Name = "max_tokens", EmitDefaultValue = false)] internal int? MaxTokens;
+        [DataMember(Name = "max_completion_tokens", EmitDefaultValue = false)] internal int? MaxCompletionTokens;
+        [DataMember(Name = "thinking", EmitDefaultValue = false)] internal Thinking ThinkingMode;
+        [DataMember(Name = "reasoning_effort", EmitDefaultValue = false)] internal string Effort;
         [DataMember(Name = "messages")] internal ChatMessage[] Messages;
     }
 
@@ -74,6 +76,25 @@ internal sealed class DeepSeekPrivateReply : IPrivateReplyProvider, IDisposable
         [DataMember(Name = "choices")] internal Choice[] Choices { get; set; }
     }
 
+    [DataContract]
+    private sealed class BalanceResponse
+    {
+        [DataMember(Name = "is_available")] internal bool? Available { get; set; }
+    }
+
+    [DataContract]
+    private sealed class ModelList
+    {
+        [DataMember(Name = "object")] internal string Type { get; set; }
+        [DataMember(Name = "data")] internal ModelItem[] Models { get; set; }
+    }
+
+    [DataContract]
+    private sealed class ModelItem
+    {
+        [DataMember(Name = "id")] internal string Id { get; set; }
+    }
+
     private readonly HttpClient client;
     private readonly PrivateModelSettings settings;
     private readonly Uri endpoint;
@@ -82,10 +103,10 @@ internal sealed class DeepSeekPrivateReply : IPrivateReplyProvider, IDisposable
 
     internal DeepSeekPrivateReply(PrivateModelSettings settings, Func<PrivateModelTurn[]> context, Action<string> log)
     {
-        this.settings = settings;
+        this.settings = settings.Copy();
         this.context = context;
         this.log = log;
-        endpoint = settings.Validate();
+        endpoint = this.settings.Validate();
         var handler = new HttpClientHandler { AllowAutoRedirect = false, UseCookies = false,
             UseDefaultCredentials = false, UseProxy = !endpoint.IsLoopback };
         client = new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan, MaxResponseContentBufferSize = 262144 };
@@ -113,6 +134,55 @@ internal sealed class DeepSeekPrivateReply : IPrivateReplyProvider, IDisposable
         return Complete(new[] { new ChatMessage { Role = "user", Content = "请只回复：连接正常。" } }, "connection-test", cancellation);
     }
 
+    internal async Task<string> ProbeAsync(CancellationToken cancellation)
+    {
+        using (var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation))
+        {
+            deadline.CancelAfter(TimeSpan.FromSeconds(Math.Min(15, settings.TimeoutSeconds)));
+            try
+            {
+                using (var request = new HttpRequestMessage(HttpMethod.Get, ModelCapabilities.ProbeAddress(endpoint)))
+                {
+                    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", settings.ApiKey);
+                    using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseContentRead, deadline.Token).ConfigureAwait(false))
+                    {
+                        if (!response.IsSuccessStatusCode) throw StatusError(response.StatusCode);
+                        var data = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+                        deadline.Token.ThrowIfCancellationRequested();
+                        if (ModelCapabilities.IsOfficialDeepSeek(endpoint))
+                        {
+                            var balance = ParseJson<BalanceResponse>(data);
+                            if (balance == null || !balance.Available.HasValue) throw new ModelReplyException("format", "未识别到 DeepSeek 官方鉴权响应");
+                            return balance.Available.Value ? "auth-ready" : "auth-no-balance";
+                        }
+                        var models = ParseJson<ModelList>(data);
+                        if (models == null || models.Type != "list" || models.Models == null ||
+                            models.Models.Any(item => item == null || String.IsNullOrWhiteSpace(item.Id)))
+                            throw new ModelReplyException("format", "此地址未返回约定的模型列表");
+                        return "models";
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                if (cancellation.IsCancellationRequested) throw;
+                throw new ModelReplyException("timeout", "轻量检查超时");
+            }
+            catch (HttpRequestException) { throw new ModelReplyException("connection", "轻量检查连接失败或响应超限"); }
+            catch (SerializationException) { throw new ModelReplyException("format", "轻量检查没有返回约定格式"); }
+        }
+    }
+
+    private ChatRequest Request(ChatMessage[] messages)
+    {
+        var value = new ChatRequest { Model = settings.Model, Messages = messages };
+        if (settings.Provider == PrivateModelSettings.OpenAi) value.MaxCompletionTokens = 1200;
+        else value.MaxTokens = ModelCapabilities.SupportsThinking(settings, endpoint) && settings.ThinkingMode != "disabled" ? 4096 : 700;
+        if (settings.ThinkingMode != "default") value.ThinkingMode = new Thinking { Type = settings.ThinkingMode };
+        if (settings.ThinkingEffort != "default") value.Effort = settings.ThinkingEffort;
+        return value;
+    }
+
     private async Task<string> Complete(ChatMessage[] messages, string correlation, CancellationToken cancellation)
     {
         var elapsed = Stopwatch.StartNew();
@@ -128,13 +198,19 @@ internal sealed class DeepSeekPrivateReply : IPrivateReplyProvider, IDisposable
                     using (var data = new MemoryStream())
                     {
                         new DataContractJsonSerializer(typeof(ChatRequest)).WriteObject(data,
-                            new ChatRequest { Model = settings.Model, Messages = messages });
+                            Request(messages));
                         request.Content = new ByteArrayContent(data.ToArray());
                     }
                     request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
                     using (var response = await client.SendAsync(request, HttpCompletionOption.ResponseContentRead, deadline.Token).ConfigureAwait(false))
                     {
-                        if (!response.IsSuccessStatusCode) throw StatusError(response.StatusCode);
+                        if (!response.IsSuccessStatusCode)
+                        {
+                            int status = (int)response.StatusCode;
+                            if (settings.ThinkingMode != "default" && (status == 400 || status == 422))
+                                throw new ModelReplyException("request-parameters", "模型拒绝本次请求（HTTP " + status + "）。此请求含思考参数，请检查所选模型和强度。未换档或重试");
+                            throw StatusError(response.StatusCode);
+                        }
                         var data = await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
                         deadline.Token.ThrowIfCancellationRequested();
                         string answer = Parse(data);
@@ -184,8 +260,7 @@ internal sealed class DeepSeekPrivateReply : IPrivateReplyProvider, IDisposable
         ChatResponse packet;
         try
         {
-            using (var buffer = new MemoryStream(bytes))
-                packet = (ChatResponse)new DataContractJsonSerializer(typeof(ChatResponse)).ReadObject(buffer);
+            packet = ParseJson<ChatResponse>(bytes);
         }
         catch (SerializationException)
         {
@@ -203,6 +278,12 @@ internal sealed class DeepSeekPrivateReply : IPrivateReplyProvider, IDisposable
         if (text.Length > 2000)
             throw new ModelReplyException("length", "模型最终回答超出 2000 字，已跳过");
         return text;
+    }
+
+    private static T ParseJson<T>(byte[] bytes)
+    {
+        using (var buffer = new MemoryStream(bytes))
+            return (T)new DataContractJsonSerializer(typeof(T)).ReadObject(buffer);
     }
 
     public void Dispose() { client.Dispose(); }

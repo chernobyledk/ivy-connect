@@ -19,7 +19,8 @@ internal sealed class PrivateCoreForm : Form
     private readonly Button start = new Button { Text = "开始回复", AutoSize = true };
     private readonly Button pause = new Button { Text = "暂停", AutoSize = true };
     private readonly Button stop = new Button { Text = "停止", AutoSize = true };
-    private readonly Button configure = new Button { Text = "模型设置", AutoSize = true };
+    private readonly Button configure = new Button { Text = "模型与密钥", AutoSize = true };
+    private readonly Label modelSummary = new Label { Dock = DockStyle.Fill, Padding = new Padding(6, 3, 4, 2), AutoEllipsis = true };
     private readonly Button clearContext = new Button { Text = "清空上下文", AutoSize = true };
     private readonly Button findQq = new Button { Text = "连接 QQ", AutoSize = true };
     private readonly Button pickQq = new Button { Text = "选择 QQ 窗口", AutoSize = true };
@@ -51,6 +52,7 @@ internal sealed class PrivateCoreForm : Form
     private bool restoreAfterStop;
     private QqCandidate selectedCandidate;
     private PrivateBindingProof liveProof;
+    private string runningModelName;
 
     internal PrivateCoreForm(string folder, Predicate<ReplyRow> acceptIncoming = null)
     {
@@ -60,8 +62,8 @@ internal sealed class PrivateCoreForm : Form
         launcherIcon = PresentationAssets.ReadIcon();
         Icon = launcherIcon;
         tray.Icon = launcherIcon;
-        ClientSize = new Size(720, 665);
-        MinimumSize = new Size(640, 680);
+        ClientSize = new Size(750, 721);
+        MinimumSize = new Size(670, 731);
         StartPosition = FormStartPosition.CenterScreen;
         var grid = new TableLayoutPanel { Dock = DockStyle.Top, Height = 177, Padding = new Padding(8),
             ColumnCount = 2, RowCount = 5, GrowStyle = TableLayoutPanelGrowStyle.FixedSize };
@@ -87,13 +89,19 @@ internal sealed class PrivateCoreForm : Form
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 68, Padding = new Padding(6) };
         mode.Items.AddRange(new[] { "固定回复", "模型回复" });
         mode.SelectedIndex = 0;
-        buttons.Controls.AddRange(new Control[] { bind, mode, start, pause, stop, configure, clearContext });
+        buttons.Controls.AddRange(new Control[] { bind, mode, start, pause, stop, clearContext });
         var location = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 54, Padding = new Padding(6, 4, 6, 0) };
         location.Controls.AddRange(new Control[] { findQq, pickQq, showQq, sideQq, restoreQq, advanced });
         var masks = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 37, Padding = new Padding(6, 1, 6, 0) };
         masks.Controls.AddRange(new Control[] { showCover, closeCover, chooseCover, resetCover });
         var receipts = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 36, Padding = new Padding(6, 1, 6, 0) };
         receipts.Controls.AddRange(new Control[] { recheckReceipt, markPeerReceipt });
+        var modelHeader = new TableLayoutPanel { Dock = DockStyle.Top, Height = 58, Padding = new Padding(6, 4, 6, 2), ColumnCount = 2 };
+        modelHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 108));
+        modelHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        configure.Dock = DockStyle.Fill;
+        modelHeader.Controls.Add(configure, 0, 0);
+        modelHeader.Controls.Add(modelSummary, 1, 0);
         Controls.Add(status);
         Controls.Add(buttons);
         Controls.Add(location);
@@ -105,6 +113,7 @@ internal sealed class PrivateCoreForm : Form
         Controls.Add(grid);
         Controls.Add(boundChat);
         Controls.Add(connectionState);
+        Controls.Add(modelHeader);
         pictureCover = new PictureCoverController(folder, text => coverStatus.Text = text);
         DisplayBinding(null, false);
         SetConnection("未连接", "请在自动回复账号中打开目标私聊，然后点击「连接 QQ」或「开始回复」。");
@@ -126,6 +135,7 @@ internal sealed class PrivateCoreForm : Form
             Log("startup version=" + Application.ProductVersion + " pid=" + System.Diagnostics.Process.GetCurrentProcess().Id);
         }
         catch (Exception ex) { SetConnection("未连接", "状态不可读取。" + ModelConfigForm.DisplayError(ex)); }
+        RefreshModelSummary();
         findQq.Click += async (s, e) => await LocateQq();
         pickQq.Click += async (s, e) => await SelectCandidate();
         advanced.Click += (s, e) => {
@@ -165,17 +175,11 @@ internal sealed class PrivateCoreForm : Form
             bindPrompt.End();
             if (enrollment != null) enrollment.Cancel();
         };
-        configure.Click += (s, e) => { using (var dialog = new ModelConfigForm(ModelPath, Log)) dialog.ShowDialog(this); };
-        clearContext.Click += (s, e) => {
-            if (MessageBox.Show(this, "清空此私聊的模型上下文？收发状态和核验绑定会保留。", "清空上下文",
-                MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
-            try
-            {
-                using (var store = new PrivateStore(folder)) store.ClearModelContext();
-                status.Text = "已清空模型上下文。";
-            }
-            catch (Exception ex) { status.Text = "清空失败 · " + Experiment.Failure(ex); }
+        configure.Click += (s, e) => {
+            using (var dialog = new ModelConfigForm(folder, Log, ClearContext, runningModelName)) dialog.ShowDialog(this);
+            RefreshModelSummary();
         };
+        clearContext.Click += (s, e) => ClearContext();
         mode.SelectedIndexChanged += (s, e) => {
             status.Text = mode.SelectedIndex == 0 ? "固定回复模式。点击启动后开始监听。" :
                 "模型回复模式。启动后，已绑定私聊的新文字和设置范围内的上下文会发送给所配置的 API。";
@@ -515,11 +519,41 @@ internal sealed class PrivateCoreForm : Form
         }
         catch (Exception ex) { SetConnection("收件登记未完成", ModelConfigForm.DisplayError(ex)); }
     }
-    private string ModelPath { get { return Path.Combine(folder, "model-settings.dpapi"); } }
+    private void RefreshModelSummary()
+    {
+        try
+        {
+            var current = ModelCatalogFile.Load(folder).Active;
+            modelSummary.Text = current == null ? "尚未选择当前模型配置。" :
+                current.Name + " · " + current.Settings.Provider + " · " + current.Settings.Model +
+                "\r\n思考 " + ModelCapabilities.DescribeThinking(current.Settings) + " · " + current.Availability() +
+                (String.IsNullOrEmpty(current.Settings.ApiKey) ? " · 无密钥" : " · 密钥 ••••••••");
+            if (runningModelName != null) modelSummary.Text += "\r\n运行中使用「" + runningModelName + "」的启动快照";
+        }
+        catch (Exception) { modelSummary.Text = "模型配置无法解密或读取。请检查「模型与密钥」。"; }
+    }
+
+    private void ClearContext()
+    {
+        if (run != null || enrollment != null || connecting)
+        {
+            MessageBox.Show(this, "请先停止回复或核验，再清空聊天上下文。", "清空上下文");
+            return;
+        }
+        if (MessageBox.Show(this, "清空此私聊的模型上下文？收发状态和核验绑定会保留。", "清空上下文",
+            MessageBoxButtons.OKCancel, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.OK) return;
+        try
+        {
+            using (var store = new PrivateStore(folder)) store.ClearModelContext();
+            status.Text = "已清空模型上下文。";
+        }
+        catch (Exception ex) { status.Text = "清空失败 · " + Experiment.Failure(ex); }
+    }
     private void UpdateButtons()
     {
         var idle = run == null && enrollment == null && !connecting;
-        bind.Enabled = start.Enabled = attested.Enabled = configure.Enabled = clearContext.Enabled = mode.Enabled = idle;
+        bind.Enabled = start.Enabled = attested.Enabled = clearContext.Enabled = mode.Enabled = idle;
+        configure.Enabled = !connecting && enrollment == null;
         foreach (var field in fields) field.Enabled = idle;
         findQq.Enabled = pickQq.Enabled = sideQq.Enabled = idle;
         recheckReceipt.Enabled = markPeerReceipt.Enabled = idle;
@@ -642,19 +676,34 @@ internal sealed class PrivateCoreForm : Form
     private async Task StartCore()
     {
         var useModel = mode.SelectedIndex == 1;
+        PrivateModelProfile selected = null;
+        PrivateModelSettings snapshot = null;
+        if (useModel)
+        {
+            try
+            {
+                selected = ModelCatalogFile.Load(folder).Active;
+                if (selected == null) throw new ModelReplyException("profile", "请先在「模型与密钥」中设为当前配置");
+                snapshot = selected.Settings.Copy();
+                snapshot.Validate();
+            }
+            catch (Exception ex) { SetConnection("模型配置待检查", ModelConfigForm.DisplayError(ex)); return; }
+        }
         var connected = await LocateQq();
         if (connected == null || closePending || IsDisposed) return;
         using (var active = new PrivateRunControl())
         {
             liveProof = connected;
             run = active;
+            runningModelName = selected == null ? null : selected.Name;
+            RefreshModelSummary();
             pause.Text = "暂停";
             SetConnection("已就绪", "正在重新建立消息基线…");
             UpdateButtons();
-            try { SetConnection("已停止", await Task.Run(() => Watch(connected, useModel, active))); }
+            try { SetConnection("已停止", await Task.Run(() => Watch(connected, snapshot, active))); }
             catch (OperationCanceledException) { SetConnection("已停止", "请点击「开始回复」再次核验并启动。"); }
             catch (Exception ex) { SetConnection("未连接", "启动已停止。" + ModelConfigForm.DisplayError(ex)); }
-            finally { run = null; liveProof = null; Finished(); }
+            finally { run = null; liveProof = null; runningModelName = null; RefreshModelSummary(); Finished(); }
         }
         if (restoreAfterStop && !closePending && !IsDisposed)
         {
@@ -662,14 +711,14 @@ internal sealed class PrivateCoreForm : Form
             await ArrangeQq("restore");
         }
     }
-    private string Watch(PrivateBindingProof connected, bool useModel, PrivateRunControl active)
+    private string Watch(PrivateBindingProof connected, PrivateModelSettings snapshot, PrivateRunControl active)
     {
         using (var store = new PrivateStore(folder))
         {
             var proof = store.State.Binding;
             if (proof == null || proof.RouteStamp() != connected.RouteStamp())
                 throw new PrivateRouteLostException("连接后核验记录已变更，请重新连接原私聊");
-            using (var modelReply = useModel ? new DeepSeekPrivateReply(ModelSettingsFile.Load(ModelPath),
+            using (var modelReply = snapshot != null ? new DeepSeekPrivateReply(snapshot,
                 () => store.State.ModelTurns, Log) : null)
             using (var transport = new QqPrivateTransport(proof, active.Token.ThrowIfCancellationRequested, Log))
             {

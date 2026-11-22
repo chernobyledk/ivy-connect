@@ -49,8 +49,8 @@ internal sealed class PrivateLiveCheck : Form
         {
             var s = File.ReadAllLines(settings, Encoding.UTF8);
             if (s.Length < 8 || !Regex.IsMatch(s[6], "^[A-F0-9]{12}$") ||
-                !new[] { "send", "send-side", "send-receipt", "restart", "restart-real", "recover", "cleanup", "send-model-mock", "send-model-real" }.Contains(s[7]) ||
-                s.Length != (s[7] == "send-model-mock" || s[7] == "send-model-real" ? 9 : 8))
+                !new[] { "send", "send-side", "send-receipt", "restart", "restart-real", "recover", "cleanup", "send-model-mock", "send-model-real", "send-model-profile" }.Contains(s[7]) ||
+                s.Length != (s[7] == "send-model-mock" || s[7] == "send-model-real" || s[7] == "send-model-profile" ? 9 : 8))
                 throw new InvalidOperationException("真机验证配置无效");
             if (s[7] == "send-model-mock")
             {
@@ -100,7 +100,7 @@ internal sealed class PrivateLiveCheck : Form
             }
             await PrepareEditor(Target.FromKnownHandle(Int64.Parse(s[2])), s[3], s[4], "peer", control.Token, Log);
             await PrepareEditor(target, proof.PeerDisplay, proof.HeaderProof, "bot", control.Token, Log);
-            if (s[7] == "send-side" || s[7] == "send-model-real" || s[7] == "send-receipt")
+            if (s[7] == "send-side" || s[7] == "send-model-real" || s[7] == "send-model-profile" || s[7] == "send-receipt")
             {
                 await Task.Run(() => QqConnection.VerifyUnique(proof, control.Token.ThrowIfCancellationRequested, Log), control.Token);
                 beforeMove = Native.Bounds(target.Hwnd);
@@ -269,11 +269,12 @@ internal sealed class PrivateLiveCheck : Form
 
     private void Verify(string[] s, string output, bool restart, PrivateBindingProof proof, Target target, Action guard)
     {
-        var realModel = s[7] == "send-model-real" || s[7] == "restart-real";
+        var realModel = s[7] == "send-model-real" || s[7] == "send-model-profile" || s[7] == "restart-real";
         var forceReceiptRestart = s[7] == "send-receipt";
         using (var store = new PrivateStore(output))
         using (var transport = new QqPrivateTransport(proof, guard, Log))
-        using (var model = s[7] == "send-model-real" ? new DeepSeekPrivateReply(ModelSettingsFile.Load(s[8]), () => store.State.ModelTurns, Log) :
+        using (var model = s[7] == "send-model-profile" ? new DeepSeekPrivateReply(ModelCatalogFile.Load(s[8]).Active.Settings, () => store.State.ModelTurns, Log) :
+            s[7] == "send-model-real" ? new DeepSeekPrivateReply(ModelSettingsFile.Load(s[8]), () => store.State.ModelTurns, Log) :
             s[7] == "send-model-mock" ? new DeepSeekPrivateReply(new PrivateModelSettings {
             Endpoint = s[8], Model = "mock-qq", ApiKey = "test-only-placeholder-never-real",
             TimeoutSeconds = 8, ContextTurns = 2, RolePrompt = "Use short answers."
