@@ -27,7 +27,9 @@ internal static partial class Program
             bool selfPad = arguments.Length == 6 && arguments[0] == "--self-test-pad";
             bool selfTest = (arguments.Length == 1 || arguments.Length == 2 &&
                 (arguments[1] == "--diagnostic" || arguments[1] == "--foreground-invoke-control" ||
-                 arguments[1] == "--foreground-keyboard-control" || arguments[1] == "--foreground-enter-control"))
+                 arguments[1] == "--foreground-keyboard-control" || arguments[1] == "--foreground-enter-control" ||
+                 arguments[1] == "--verify-window-states" || arguments[1] == "--verify-covered-reply" ||
+                 arguments[1] == "--verify-covered-small" || SelfTestForm.IsDesktopSingle(arguments[1])))
                 && arguments[0] == "--self-test";
             bool continuous = (arguments.Length == 1 || arguments.Length == 2) && arguments[0] == "--continuous";
             if (arguments.Length != 0 && !autoMatrix && !awaitSelf && !typingPad && !baseline && !round2 &&
@@ -58,6 +60,11 @@ internal static partial class Program
             Application.Run(form);
             return 0;
         }
+        catch (SelfTestHalt ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
         catch (Exception ex)
         {
             Console.Error.WriteLine("{0} (0x{1:X8})", ex.GetType().Name, ex.HResult);
@@ -67,6 +74,24 @@ internal static partial class Program
 
     private static int RunCommand(string[] arguments)
     {
+        if (arguments.Length == 1 && arguments[0] == "--inspect-verified-window")
+            return Task.Run(() => LocalSendComparison.InspectWindow()).GetAwaiter().GetResult();
+        if (arguments.Length >= 2 && arguments[0] == "--audit-verified-markers")
+            return Task.Run(() => LocalSendComparison.Audit(arguments.Skip(1).ToArray())).GetAwaiter().GetResult();
+        if (arguments.Length == 1 && arguments[0] == "--capture-verified-empty-editor")
+            return Task.Run(() => LocalSendComparison.CaptureEmptyEditor()).GetAwaiter().GetResult();
+        if (arguments.Length == 1 && arguments[0] == "--refresh-verified-qq-display")
+            return Task.Run(() => LocalSendComparison.RefreshDisplay()).GetAwaiter().GetResult();
+        if (arguments.Length == 2 && arguments[0] == "--refresh-confirmed-self-binding")
+            return Task.Run(() => SelfTestIdentity.RefreshConfirmedForeground(Target.FromKnownHandle(Int64.Parse(arguments[1]))))
+                .GetAwaiter().GetResult();
+        if ((arguments.Length == 2 || arguments.Length == 3) && arguments[0] == "--bind-operator-verified-self")
+            return Task.Run(() => SelfTestIdentity.BindOperatorVerified(Target.FromKnownHandle(Int64.Parse(arguments[1])),
+                arguments.Length == 3 ? arguments[2] : null))
+                .GetAwaiter().GetResult();
+        if (arguments.Length == 3 && arguments[0] == "--local-send-comparison" &&
+            (arguments[1] == "observe" || arguments[1] == "fill" || arguments[1] == "submit"))
+            return Task.Run(() => LocalSendComparison.Run(arguments[1], arguments[2])).GetAwaiter().GetResult();
         if (arguments.Length == 4 && arguments[0] == "--recover-self-test-draft")
             return Task.Run(() => {
                 var id = arguments[1];
@@ -79,7 +104,8 @@ internal static partial class Program
                 var budget = new SelfTestBudget(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
                     "runs", "R4-budget-20261121.log"));
                 if (!budget.WasReserved(body)) return 2;
-                using (var mutex = new System.Threading.Mutex(false, @"Local\QQWindowLab.Continuous.397068"))
+                var verifiedTarget = SelfTestIdentity.OpenTarget();
+                using (var mutex = new System.Threading.Mutex(false, @"Local\QQWindowLab.Continuous." + verifiedTarget.Hwnd.ToInt64()))
                 {
                     bool owned;
                     try { owned = mutex.WaitOne(0); }
@@ -87,7 +113,7 @@ internal static partial class Program
                     if (!owned) return 2;
                     try
                     {
-                        var self = new SelfTestIdentity(Target.FromKnownHandle(397068));
+                        var self = new SelfTestIdentity(verifiedTarget);
                         return self.ClearUnsubmittedDraft(body, Console.WriteLine) ? 0 : 2;
                     }
                     finally { mutex.ReleaseMutex(); }

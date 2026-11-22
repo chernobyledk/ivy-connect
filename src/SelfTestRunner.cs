@@ -29,6 +29,8 @@ internal sealed class SelfTestRunner
     private readonly bool foregroundEnter;
     private int sequence;
     private string pendingDraft;
+    private string minimizedDraft;
+    private bool expectMinimized;
 
     internal SelfTestRunner(SelfTestIdentity identity, SelfTestProtocol protocol, SelfTestBudget budget,
         Action<string> log, CancellationToken cancel, bool foregroundKeyboard, bool foregroundEnter)
@@ -51,8 +53,9 @@ internal sealed class SelfTestRunner
         for (int n = 0; ; n++)
         {
             cancel.ThrowIfCancellationRequested();
-            if (!target.SameWindow() || Native.IsIconic(target.Hwnd) || !Native.Visible(target.Hwnd))
-                throw new SelfTestHalt("QQ 绑定失效或未展开，停止发送");
+            if (!target.SameWindow() || Native.IsIconic(target.Hwnd) != expectMinimized || !Native.Visible(target.Hwnd) ||
+                !Native.IsWindowEnabled(target.Hwnd))
+                throw new SelfTestHalt("QQ 绑定失效、显示状态变化或被系统禁用，停止发送");
             try
             {
                 Controls ui;
@@ -75,8 +78,9 @@ internal sealed class SelfTestRunner
         return rows;
     }
     internal SelfTestResult Stage(string label, int pairs, Func<bool> permitted, ForegroundTrace trace,
-        string foreignMarker, bool foregroundControl)
+        string foreignMarker, bool foregroundControl, bool sendOnly = false, bool minimized = false)
     {
+        expectMinimized = minimized;
         var result = new SelfTestResult();
         var timeline = new ReplyTimeline();
         var foregroundStart = trace.Count;
@@ -99,13 +103,15 @@ internal sealed class SelfTestRunner
                 int seq = ++sequence;
                 var input = protocol.Input(seq);
                 var output = protocol.Output(seq);
-                protocol.Arm(seq);
+                if (!sendOnly && !foregroundControl) protocol.Arm(seq);
                 var readback = Send(label, input, true, timeline, result, permitted, trace, foregroundStart, foregroundControl);
-                if (foregroundControl)
+                VerifyPadNotInHistory(readback, foreignMarker, result);
+                if (foregroundControl || sendOnly)
                 {
-                    log(label + " positive control locally confirmed; no automatic reply attempted");
+                    if (sendOnly) CheckFocus(permitted, trace, foregroundStart);
+                    log(label + " single submission locally confirmed; no automatic reply attempted");
                     result.Passed++;
-                    break;
+                    continue;
                 }
                 var added = timeline.Advance(readback);
                 var eligible = added.Count(protocol.Consume);
@@ -124,11 +130,7 @@ internal sealed class SelfTestRunner
                     result.Duplicate++;
                     throw new InvalidOperationException("重复采样或回执错误触发监听器");
                 }
-                if (foreignMarker != null && readback.Any(row => row.Text.Contains(foreignMarker)))
-                {
-                    result.Miswrite = true;
-                    throw new InvalidOperationException("QQ 消息中发现便笺专用标记");
-                }
+                VerifyPadNotInHistory(readback, foreignMarker, result);
                 CheckFocus(permitted, trace, foregroundStart);
                 result.Passed++;
                 log(label + " pair-confirmed seq=" + seq);
@@ -139,14 +141,18 @@ internal sealed class SelfTestRunner
         {
             result.Failed++;
             result.Stopped = ex is SelfTestHalt;
-            result.Error = Experiment.Failure(ex);
+            result.Error = ex is SelfTestHalt ? ex.Message : Experiment.Failure(ex);
             log(label + " failure " + result.Error);
         }
         finally
         {
             if (pendingDraft != null)
             {
-                try { identity.ClearUnsubmittedDraft(pendingDraft, log); }
+                try
+                {
+                    if (minimized) minimizedDraft = pendingDraft;
+                    else identity.ClearUnsubmittedDraft(pendingDraft, log);
+                }
                 catch (Exception ex) { log(label + " draft recovery unavailable: " + Experiment.Failure(ex)); }
                 finally { pendingDraft = null; }
             }
@@ -160,6 +166,20 @@ internal sealed class SelfTestRunner
         }
         return result;
     }
+
+    internal void RecoverMinimizedDraft()
+    {
+        if (minimizedDraft == null) return;
+        identity.ClearUnsubmittedDraft(minimizedDraft, log);
+        minimizedDraft = null;
+    }
+
+    private static void VerifyPadNotInHistory(ReplyRow[] rows, string foreignMarker, SelfTestResult result)
+    {
+        if (foreignMarker == null || !rows.Any(row => row.Text.Contains(foreignMarker))) return;
+        result.Miswrite = true;
+        throw new InvalidOperationException("QQ 消息中发现便笺专用标记");
+    }
     private void CheckFocus(Func<bool> permitted, ForegroundTrace trace, int start)
     {
         cancel.ThrowIfCancellationRequested();
@@ -172,6 +192,7 @@ internal sealed class SelfTestRunner
         var mapped = Read(ui => {
             var rows = ReadHistory(ui);
             timeline.CheckSameConversation(rows);
+            if (ui.HasVisibleConnectionWarning()) throw new SelfTestHalt("QQ 显示连接断开或正在重连，停止发送");
             if (!ui.EmptyDraft()) throw new SelfTestHalt("输入框有草稿，停止发送");
             if (Count(rows, expected) != 0) throw new InvalidOperationException("发送前发现同编号");
             if (foregroundControl && foregroundKeyboard)
@@ -214,6 +235,7 @@ internal sealed class SelfTestRunner
         var button = Read(ui => {
             var rows = ReadHistory(ui);
             timeline.CheckSameConversation(rows);
+            if (ui.HasVisibleConnectionWarning()) throw new SelfTestHalt("QQ 显示连接断开或正在重连，停止发送");
             if (ui.Draft() != body) throw new SelfTestHalt("提交前草稿已变化，停止发送");
             if (Count(rows, expected) != 0) throw new InvalidOperationException("提交前编号已出现");
             var node = ui.Button;

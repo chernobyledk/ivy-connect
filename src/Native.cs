@@ -37,6 +37,7 @@ internal static partial class Native
     [DllImport("user32.dll")] internal static extern bool EnumWindows(EnumCallback cb, IntPtr data);
     [DllImport("user32.dll")] internal static extern bool EnumChildWindows(IntPtr parent, EnumCallback cb, IntPtr data);
     [DllImport("user32.dll")] internal static extern bool IsWindowVisible(IntPtr hwnd);
+    [DllImport("user32.dll")] internal static extern bool IsWindowEnabled(IntPtr hwnd);
     [DllImport("user32.dll")] internal static extern bool IsIconic(IntPtr hwnd);
     [DllImport("user32.dll")] internal static extern bool IsZoomed(IntPtr hwnd);
     [DllImport("user32.dll")] internal static extern bool SetProcessDpiAwarenessContext(IntPtr context);

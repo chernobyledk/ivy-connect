@@ -120,7 +120,8 @@ internal sealed class ContinuousReply
     {
         cancel.ThrowIfCancellationRequested();
         if (paused()) throw new InvalidOperationException("操作员已暂停");
-        if (Native.IsIconic(target.Hwnd) || !ForegroundOk(foreground) || trace.Count != events)
+        if (Native.IsIconic(target.Hwnd) || !Native.IsWindowEnabled(target.Hwnd) ||
+            !ForegroundOk(foreground) || trace.Count != events)
             throw new InvalidOperationException("最小化、遮挡条件或其他软件的前台状态已变");
     }
     internal void Run()
@@ -167,6 +168,7 @@ internal sealed class ContinuousReply
                     if (queue.Count == 0) { Status("等待新测试消息"); Wait(350); continue; }
                     var foreground = permittedForeground();
                     if (!ForegroundOk(foreground)) { Status("暂停：等待指定的其他前台软件"); Wait(400); continue; }
+                    if (ui.HasVisibleConnectionWarning()) { Status("暂停：QQ 显示连接断开或正在重连"); Wait(600); continue; }
                     if (!ui.EmptyDraft()) { Status("暂停：输入框有草稿或未能确认空白"); Wait(500); continue; }
                     Dispatch(queue.Peek(), foreground, trace.Count);
                 }
@@ -193,6 +195,7 @@ internal sealed class ContinuousReply
             timeline.CheckSameConversation(controls.ReplyRows());
             return controls;
         });
+        if (ui.HasVisibleConnectionWarning()) throw new InvalidOperationException("QQ 显示连接断开或正在重连");
         if (!ui.EmptyDraft()) throw new InvalidOperationException("写入前输入框出现草稿");
         var mapped = MsaaProbe.FindMappedEditor(target, ui);
         if (mapped == null) throw new InvalidOperationException("未能复核 MSAA 编辑对象");
@@ -229,6 +232,7 @@ internal sealed class ContinuousReply
             Guard(foreground, events);
             if (!binding.Matches(ui) || ui.Draft() != item.Reply)
                 throw new InvalidOperationException("发送前会话或草稿发生变化");
+            if (ui.HasVisibleConnectionWarning()) throw new InvalidOperationException("发送前 QQ 显示连接断开或正在重连");
             Guard(foreground, events);
             item.Phase = "send-intent";
             log("send-intent item=" + item.Number + " method=LegacyIAccessible.DoDefaultAction");

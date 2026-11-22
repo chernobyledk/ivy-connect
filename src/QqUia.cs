@@ -125,6 +125,27 @@ internal sealed class Controls
     {
         return Header == null ? null : Header.Current.Name.Trim();
     }
+
+    internal bool HasVisibleConnectionWarning()
+    {
+        var warnings = new[] { "连接断开", "连接已断开", "网络连接断开", "网络连接已断开", "正在重新连接" };
+        var condition = new OrCondition(warnings.Select(s =>
+            (Condition)Is(AutomationElement.NameProperty, s)).ToArray());
+        foreach (var warning in Nodes(origin, TreeScope.Descendants, condition))
+        {
+            if (warning.Current.IsOffscreen) continue;
+            bool status = false;
+            for (var node = warning; node != null && !node.Equals(origin); node = TreeWalker.RawViewWalker.GetParent(node))
+            {
+                if (node.Equals(History) || node.Equals(EditorContainer)) { status = false; break; }
+                status |= node.Current.ControlType == ControlType.StatusBar ||
+                    Regex.IsMatch(node.Current.ClassName, @"(?:toast|notification|network-status|connection-status|dialog|alert)",
+                        RegexOptions.IgnoreCase);
+            }
+            if (status) return true;
+        }
+        return false;
+    }
     internal ValuePattern Value { get { return Pattern<ValuePattern>(Editor, ValuePattern.Pattern); } }
     internal InvokePattern Invoke { get { return Pattern<InvokePattern>(Button, InvokePattern.Pattern); } }
     internal LegacyEditor.ILegacy Legacy(AutomationElement node) { return LegacyEditor.Find(origin, node); }
@@ -371,6 +392,7 @@ internal sealed class Binding
     private readonly string header;
     private readonly int[] headerId;
     internal readonly bool Self;
+    internal string HeaderProof { get { return MessageSnapshot.Hash(header + "\n" + String.Join(".", headerId)); } }
     // The operator verifies QQ numbers locally. The program stores no account number.
     internal Binding(Target target, bool self)
     {
