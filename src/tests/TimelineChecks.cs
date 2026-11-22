@@ -31,5 +31,17 @@ internal static class TimelineChecks
         catch (InvalidOperationException) { blocked = true; }
         Require(blocked, "missing anchor stops rather than replaying");
         Require(timeline.Advance(new[] { one, two, Row("e", "appended") }).Length == 0, "recovered old anchor does not replay");
+
+        var protocol = new SelfTestProtocol("EXAMPLE");
+        var otherRun = new SelfTestProtocol("OTHER");
+        protocol.Arm(1);
+        Require(!protocol.Consume(new ReplyRow("test-other-run", new[] { otherRun.Input(1) }, true)), "another run is ignored");
+        Require(!protocol.Consume(new ReplyRow("test-output", new[] { protocol.Output(1) }, true)), "TEST_OUT cannot trigger");
+        Require(!protocol.Consume(new ReplyRow("test-nonself", new[] { protocol.Input(1) }, false)), "nonself input is ignored");
+        var controlled = new ReplyRow("test-self", new[] { protocol.Input(1) }, true);
+        Require(protocol.Consume(controlled) && !protocol.Consume(controlled), "armed TEST_IN accepted exactly once");
+        protocol.Arm(2);
+        protocol.Disable();
+        Require(!protocol.Consume(new ReplyRow("test-disabled", new[] { protocol.Input(2) }, true)), "disabling removes armed input");
     }
 }

@@ -237,8 +237,19 @@ internal sealed class Controls
             var id = bubble.GetRuntimeId();
             if (id == null || id.Length == 0) throw new InvalidOperationException("消息气泡缺少 UIA 标识");
             var parts = ReadBubble(bubble, 6).Take(200).ToArray();
-            return new ReplyRow(String.Join(".", id), parts);
+            return new ReplyRow(String.Join(".", id), parts, OwnMessage(bubble));
         }).ToArray();
+    }
+    private static bool? OwnMessage(AutomationElement bubble)
+    {
+        var walker = TreeWalker.RawViewWalker;
+        for (var node = bubble; node != null; node = walker.GetParent(node))
+        {
+            if (HasClass(node, "message-container--self")) return true;
+            if (HasClass(node, "message-container")) return false;
+            if (HasClass(node, "ml-root")) break;
+        }
+        return null;
     }
     internal MessageSnapshot Messages(params string[] markers)
     {

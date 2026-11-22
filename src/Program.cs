@@ -24,12 +24,20 @@ internal static partial class Program
             bool awaitSelf = (arguments.Length == 2 || arguments.Length == 3 && arguments[2] == "--watch-f") &&
                 arguments[0] == "--await-verified-self";
             bool typingPad = arguments.Length >= 5 && arguments.Length <= 7 && arguments[0] == "--typing-pad";
+            bool selfPad = arguments.Length == 6 && arguments[0] == "--self-test-pad";
+            bool selfTest = (arguments.Length == 1 || arguments.Length == 2 &&
+                (arguments[1] == "--diagnostic" || arguments[1] == "--foreground-invoke-control" ||
+                 arguments[1] == "--foreground-keyboard-control" || arguments[1] == "--foreground-enter-control"))
+                && arguments[0] == "--self-test";
             bool continuous = (arguments.Length == 1 || arguments.Length == 2) && arguments[0] == "--continuous";
             if (arguments.Length != 0 && !autoMatrix && !awaitSelf && !typingPad && !baseline && !round2 &&
-                !region && !finishRegion && !msaaWitness && !fullOcclusionWitness && !continuous) return RunCommand(arguments);
+                !region && !finishRegion && !msaaWitness && !fullOcclusionWitness && !continuous && !selfTest && !selfPad)
+                return RunCommand(arguments);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             if (typingPad) { TypingPad.Show(arguments); return 0; }
+            if (selfPad) { TypingPad.ShowAutomatic(arguments); return 0; }
+            if (selfTest) { Application.Run(new SelfTestForm(arguments.Length == 2 ? arguments[1] : null)); return 0; }
             if (continuous)
             {
                 var panel = new ContinuousForm();
@@ -59,6 +67,32 @@ internal static partial class Program
 
     private static int RunCommand(string[] arguments)
     {
+        if (arguments.Length == 4 && arguments[0] == "--recover-self-test-draft")
+            return Task.Run(() => {
+                var id = arguments[1];
+                int seq;
+                if (!System.Text.RegularExpressions.Regex.IsMatch(id, "^[0-9A-F]{10}$") ||
+                    !Int32.TryParse(arguments[2], out seq) || seq < 1 || seq > SelfTestBudget.Cap ||
+                    (arguments[3] != "in" && arguments[3] != "out")) return 2;
+                var protocol = new SelfTestProtocol(id);
+                var body = arguments[3] == "in" ? protocol.Input(seq) : protocol.Output(seq);
+                var budget = new SelfTestBudget(Path.Combine(AppDomain.CurrentDomain.BaseDirectory,
+                    "runs", "R4-budget-20261121.log"));
+                if (!budget.WasReserved(body)) return 2;
+                using (var mutex = new System.Threading.Mutex(false, @"Local\QQWindowLab.Continuous.397068"))
+                {
+                    bool owned;
+                    try { owned = mutex.WaitOne(0); }
+                    catch (System.Threading.AbandonedMutexException) { owned = true; }
+                    if (!owned) return 2;
+                    try
+                    {
+                        var self = new SelfTestIdentity(Target.FromKnownHandle(397068));
+                        return self.ClearUnsubmittedDraft(body, Console.WriteLine) ? 0 : 2;
+                    }
+                    finally { mutex.ReleaseMutex(); }
+                }
+            }).GetAwaiter().GetResult();
         if (arguments[0] == "--list")
         {
             Console.WriteLine("session={0} foreground={1}", Target.Session, Native.GetForegroundWindow().ToInt64());

@@ -51,6 +51,8 @@ internal sealed class SideEffects : IDisposable
         changedClipboard |= Native.GetClipboardSequenceNumber() != clipboard;
     }
     internal bool FocusChanged { get { return changedForeground || Native.GetForegroundWindow() != foreground; } }
+    internal bool ClipboardChanged { get { return changedClipboard; } }
+    internal bool CursorChanged { get { return movedCursor; } }
     public void Dispose()
     {
         stop.Set();

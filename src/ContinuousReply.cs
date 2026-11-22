@@ -95,6 +95,8 @@ internal sealed class ContinuousReply
                 log("ignored own-response prefix count=" + ignoredReplies);
                 continue;
             }
+            if (row.Own != false || row.Text.StartsWith("TEST_IN", StringComparison.Ordinal) ||
+                row.Text.StartsWith("TEST_OUT", StringComparison.Ordinal)) continue;
             var match = testInput.Match(row.Text);
             if (!match.Success) continue;
             var item = new Item { Number = ++received, Case = match.Groups[1].Value, Phase = "queued" };

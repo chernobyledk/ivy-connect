@@ -6,10 +6,12 @@ internal sealed class ReplyRow
 {
     internal readonly string Key, Digest, Text;
     internal readonly int Segments;
-    internal ReplyRow(string key, string[] parts)
+    internal readonly bool? Own;
+    internal ReplyRow(string key, string[] parts, bool? own = null)
     {
         Key = key;
         Segments = parts.Length;
+        Own = own;
         Text = MessageSnapshot.Normalize(String.Concat(parts));
         Digest = MessageSnapshot.Hash(Text);
     }
