@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,7 +15,13 @@ internal interface IPrivateTransport
 internal sealed class ReplyDraft
 {
     internal readonly string Text, RecoveryTag;
-    internal ReplyDraft(string text, string recoveryTag) { Text = text; RecoveryTag = recoveryTag; }
+    internal readonly int ModelContextLimit;
+    internal ReplyDraft(string text, string recoveryTag, int modelContextLimit = 0)
+    {
+        Text = text;
+        RecoveryTag = recoveryTag;
+        ModelContextLimit = modelContextLimit;
+    }
 }
 
 internal interface IPrivateReplyProvider
@@ -39,9 +46,11 @@ internal sealed class PrivateRunControl : IDisposable
     private readonly object gate = new object();
     private readonly CancellationTokenSource stop = new CancellationTokenSource();
     private volatile bool paused;
+    private int revision;
     internal CancellationToken Token { get { return stop.Token; } }
     internal bool Paused { get { return paused; } }
-    internal void Pause() { paused = true; }
+    internal int Revision { get { return Volatile.Read(ref revision); } }
+    internal void Pause() { paused = true; Interlocked.Increment(ref revision); }
     internal void Resume() { Token.ThrowIfCancellationRequested(); paused = false; }
     internal void Stop() { stop.Cancel(); }
     internal void Check()
@@ -49,13 +58,18 @@ internal sealed class PrivateRunControl : IDisposable
         Token.ThrowIfCancellationRequested();
         if (paused) throw new PrivatePausedException();
     }
-    internal void Commit(Action record, Action submit)
+    internal void Check(int capturedRevision)
+    {
+        Check();
+        if (capturedRevision != Revision) throw new PrivatePausedException();
+    }
+    internal void Commit(int capturedRevision, Action record, Action submit)
     {
         lock (gate)
         {
-            Check();
+            Check(capturedRevision);
             record();
-            Check();
+            Check(capturedRevision);
             submit();
         }
     }
@@ -182,16 +196,18 @@ internal sealed class PrivateReplyCore
         if (next != null) Respond(next);
     }
 
-    private void Verify(PrivateEvent item, bool checkMatchingReply)
+    private ReplyRow[] Verify(PrivateEvent item, int revision, bool checkMatchingReply)
     {
-        control.Check();
+        control.Check(revision);
         RequireRoute(item.BotQq, item.PeerQq);
         var rows = wire.Read();
         timeline.CheckSameConversation(rows);
         if (!rows.Any(row => row.Key == item.RuntimeKey && row.Digest == item.Digest && row.Own == false))
             throw new InvalidOperationException("来信锚点不在当前已核验会话");
-        if (checkMatchingReply && rows.Any(row => row.Text == MessageSnapshot.Normalize(item.Reply)))
+        if (checkMatchingReply && item.RecoveryTag != null && rows.Any(row => row.Text == MessageSnapshot.Normalize(item.Reply)))
             throw new InvalidOperationException("发送前已有相同回复，已暂停");
+        control.Check(revision);
+        return rows;
     }
 
     private static bool HasReply(ReplyRow[] rows, PrivateEvent item)
@@ -201,27 +217,79 @@ internal sealed class PrivateReplyCore
         return matches.Length == 1 && matches[0].Own == true;
     }
 
+    private static bool HasNewReply(ReplyRow[] before, ReplyRow[] current, PrivateEvent item)
+    {
+        int tail = Array.FindIndex(current, row => row.Anchor == before[before.Length - 1].Anchor);
+        int overlap = Math.Min(tail + 1, before.Length);
+        if (overlap < Math.Min(2, before.Length))
+            throw new InvalidOperationException("提交前的消息尾部已变化，不能确认新气泡");
+        for (int i = 0; i < overlap; i++)
+            if (current[tail - i].Anchor != before[before.Length - 1 - i].Anchor)
+                throw new InvalidOperationException("提交前后的气泡顺序无法核对");
+        var expected = MessageSnapshot.Normalize(item.Reply);
+        var hits = current.Skip(tail + 1).Where(row => row.Own == true && row.Text == expected).ToArray();
+        if (hits.Length > 1 || hits.Any(hit => before.Any(row => row.Key == hit.Key)))
+            throw new InvalidOperationException("新出站气泡不唯一或重复使用标识");
+        return hits.Length == 1;
+    }
+
+    private ReplyDraft Generate(PrivateEvent item, int revision)
+    {
+        using (var request = CancellationTokenSource.CreateLinkedTokenSource(control.Token))
+        {
+            var pending = provider.GenerateAsync(item, request.Token);
+            var lastCheck = Stopwatch.StartNew();
+            try
+            {
+                while (!pending.IsCompleted)
+                {
+                    Wait(180);
+                    control.Check(revision);
+                    if (lastCheck.ElapsedMilliseconds < 1000) continue;
+                    Verify(item, revision, false);
+                    lastCheck.Restart();
+                }
+                control.Check(revision);
+                return pending.GetAwaiter().GetResult();
+            }
+            finally
+            {
+                if (!pending.IsCompleted)
+                {
+                    request.Cancel();
+                    pending.ContinueWith(task => GC.KeepAlive(task.Exception), CancellationToken.None,
+                        TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                }
+            }
+        }
+    }
+
     private void Respond(PrivateEvent item)
     {
         bool crossed = false;
+        bool generationStarted = false;
+        int revision = control.Revision;
         try
         {
-            Verify(item, false);
+            Verify(item, revision, false);
+            int contextLimit = 0;
             if (item.Phase == PrivatePhase.Queued)
             {
-                var draft = provider.GenerateAsync(item, control.Token).GetAwaiter().GetResult();
-                control.Token.ThrowIfCancellationRequested();
+                generationStarted = true;
+                var draft = Generate(item, revision);
+                control.Check(revision);
                 if (draft == null || String.IsNullOrWhiteSpace(draft.Text) || draft.Text.Length > 2000)
                     throw new InvalidOperationException("回复正文无效或超出长度");
                 item.Reply = draft.Text;
                 item.RecoveryTag = draft.RecoveryTag == "[local:" + item.LocalId + "]" &&
                     draft.Text.EndsWith(draft.RecoveryTag, StringComparison.Ordinal) ? draft.RecoveryTag : null;
+                contextLimit = draft.ModelContextLimit;
                 Change(item, PrivatePhase.Generated, "reply-provider");
             }
-            Verify(item, true);
+            var before = Verify(item, revision, true);
             wire.RequireReady();
             Change(item, PrivatePhase.Preparing, "before-editor-write");
-            wire.Submit(item.Reply, () => Verify(item, true), submit => control.Commit(
+            wire.Submit(item.Reply, () => before = Verify(item, revision, true), submit => control.Commit(revision,
                 () => Change(item, PrivatePhase.SubmitIntent, "durable-before-default-action"),
                 () => { crossed = true; submit(); }));
             var until = System.Diagnostics.Stopwatch.StartNew();
@@ -229,9 +297,13 @@ internal sealed class PrivateReplyCore
             {
                 var rows = wire.Read();
                 timeline.CheckSameConversation(rows);
-                if (HasReply(rows, item))
+                if (HasNewReply(before, rows, item))
                 {
                     wire.RequireReady();
+                    if (contextLimit > 0)
+                        store.State.ModelTurns = ModelReplyContext.Recent(store.State.ModelTurns.Concat(new[] {
+                            new PrivateModelTurn { User = item.Body, Assistant = item.Reply }
+                        }), contextLimit).ToArray();
                     Change(item, PrivatePhase.LocalConfirmed, "unique-new-outgoing-bubble-and-empty-draft");
                     return;
                 }
@@ -241,7 +313,11 @@ internal sealed class PrivateReplyCore
         }
         catch (PrivatePausedException)
         {
-            if (item.Phase == PrivatePhase.Queued || item.Phase == PrivatePhase.Generated) return;
+            if (item.Phase == PrivatePhase.Queued || item.Phase == PrivatePhase.Generated)
+            {
+                if (generationStarted) Change(item, PrivatePhase.Cancelled, "pause-invalidated-provider-result");
+                return;
+            }
             Change(item, PrivatePhase.Cancelled, "pause-before-submit-check-draft");
             throw;
         }
@@ -254,7 +330,8 @@ internal sealed class PrivateReplyCore
             }
             else
                 Change(item, ex is OperationCanceledException ? PrivatePhase.Cancelled : PrivatePhase.Failed,
-                    ex is OperationCanceledException ? "stop-before-submit" : "blocked-before-submit");
+                    ex is OperationCanceledException ? "stop-before-submit" :
+                    ex is ModelReplyException ? "model-" + ((ModelReplyException)ex).Code : "blocked-before-submit");
             throw;
         }
     }

@@ -46,7 +46,7 @@ internal static partial class Program
             if (privateForm)
             {
                 Application.Run(new PrivateCoreForm(Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QQPrivateApp", "phase1")));
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QQPrivateApp", "phase2")));
                 return 0;
             }
             if (external) { Application.Run(new ExternalPrivateForm(arguments[1])); return 0; }
@@ -93,6 +93,8 @@ internal static partial class Program
             return ExternalWindowSetup.Restore(Int64.Parse(arguments[1]));
         if (arguments.Length == 2 && arguments[0] == "--external-hide-setup-window")
             return ExternalWindowSetup.Hide(Int64.Parse(arguments[1]));
+        if (arguments.Length == 2 && arguments[0] == "--external-minimize-setup-window")
+            return ExternalWindowSetup.Minimize(Int64.Parse(arguments[1]));
         if (arguments.Length == 1 && arguments[0] == "--inspect-verified-window")
             return Task.Run(() => LocalSendComparison.InspectWindow()).GetAwaiter().GetResult();
         if (arguments.Length >= 2 && arguments[0] == "--audit-verified-markers")

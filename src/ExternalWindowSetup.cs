@@ -40,4 +40,10 @@ internal static class ExternalWindowSetup
         var hwnd = new IntPtr(value);
         return IsClient(hwnd) && Native.ShowWindowAsync(hwnd, 0) ? 0 : 2;
     }
+
+    internal static int Minimize(long value)
+    {
+        var hwnd = new IntPtr(value);
+        return IsClient(hwnd) && Native.ShowWindowAsync(hwnd, Native.ShowMinimizedNoActivate) ? 0 : 2;
+    }
 }

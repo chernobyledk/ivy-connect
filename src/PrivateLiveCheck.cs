@@ -16,6 +16,7 @@ internal sealed class PrivateLiveCheck : Form
     private readonly string settings;
     private readonly PrivateRunControl control = new PrivateRunControl();
     private string logFile;
+    private readonly object logGate = new object();
     private bool finished;
 
     internal PrivateLiveCheck(string settings)
@@ -35,7 +36,8 @@ internal sealed class PrivateLiveCheck : Form
 
     private void Log(string line)
     {
-        File.AppendAllText(logFile, DateTimeOffset.Now.ToString("O") + " " + line + Environment.NewLine, new UTF8Encoding(false));
+        lock (logGate)
+            File.AppendAllText(logFile, DateTimeOffset.Now.ToString("O") + " " + line + Environment.NewLine, new UTF8Encoding(false));
     }
 
     private async Task Run()
@@ -43,14 +45,21 @@ internal sealed class PrivateLiveCheck : Form
         try
         {
             var s = File.ReadAllLines(settings, Encoding.UTF8);
-            if (s.Length != 8 || !Regex.IsMatch(s[6], "^[A-F0-9]{12}$") ||
-                !new[] { "send", "restart", "recover", "cleanup" }.Contains(s[7]))
+            if (s.Length < 8 || !Regex.IsMatch(s[6], "^[A-F0-9]{12}$") ||
+                !new[] { "send", "restart", "recover", "cleanup", "send-model-mock" }.Contains(s[7]) ||
+                s.Length != (s[7] == "send-model-mock" ? 9 : 8))
                 throw new InvalidOperationException("真机验证配置无效");
+            if (s[7] == "send-model-mock")
+            {
+                Uri mock;
+                if (!Uri.TryCreate(s[8], UriKind.Absolute, out mock) || !mock.IsLoopback || mock.Scheme != "http")
+                    throw new InvalidOperationException("模拟接口必须使用本机回环地址");
+            }
             var output = Path.GetFullPath(s[5]);
             Directory.CreateDirectory(output);
             logFile = Path.Combine(output, "live-" + s[6] + "-" + s[7] + ".log");
             using (File.Open(logFile, FileMode.CreateNew)) { }
-            var isRestart = s[7] != "send";
+            var isRestart = s[7] != "send" && s[7] != "send-model-mock";
             PrivateBindingProof proof;
             using (var store = new PrivateStore(output))
             {
@@ -201,6 +210,10 @@ internal sealed class PrivateLiveCheck : Form
     {
         using (var store = new PrivateStore(output))
         using (var transport = new QqPrivateTransport(proof, guard, Log))
+        using (var mock = s[7] == "send-model-mock" ? new DeepSeekPrivateReply(new PrivateModelSettings {
+            Endpoint = s[8], Model = "mock-qq", ApiKey = "test-only-placeholder-never-real",
+            TimeoutSeconds = 8, ContextTurns = 2, RolePrompt = "Use short answers."
+        }, () => store.State.ModelTurns, Log) : null)
         {
             if (s[7] == "cleanup")
             {
@@ -209,7 +222,7 @@ internal sealed class PrivateLiveCheck : Form
             }
             var scope = new ExternalPrivateScope(new[] { proof.Window.ToString(), s[6], "F", proof.BotQq, proof.PeerQq,
                 proof.PeerDisplay, "operator-verified-private-by-qq-number", s[2], s[3] });
-            var provider = new FixedPrivateReply(item => "核心验证 " + s[6] + " 已收到");
+            IPrivateReplyProvider provider = mock == null ? (IPrivateReplyProvider)new FixedPrivateReply(item => "核心验证 " + s[6] + " 已收到") : mock;
             IPrivateTransport selected = restart ? (IPrivateTransport)new ReadOnlyTransport(transport) : transport;
             var core = new PrivateReplyCore(store, selected, provider, control, row => scope.IsInput(row), Log);
             var recovering = s[7] == "recover";
@@ -258,7 +271,12 @@ internal sealed class PrivateLiveCheck : Form
                         events.Any(x => x.Phase != PrivatePhase.LocalConfirmed) || events[0].Digest != events[1].Digest ||
                         events[0].RuntimeKey == events[1].RuntimeKey || events[0].LocalId == events[1].LocalId)
                         throw new InvalidOperationException("没有满足双端确认、本人过滤与同文去重");
-                    Log("PASS same-body-different-occurrences incoming=2 confirmed=2 peer=2 own-filtered=2");
+                    if (mock != null && (store.State.ModelTurns.Length != 2 || events.Any(item => item.RecoveryTag != null) ||
+                        events[0].Reply != "模拟首轮确认 " + s[6] ||
+                        events[1].Reply != "模拟第二轮，已带入上一轮 " + s[6]))
+                        throw new InvalidOperationException("模型回执或已确认上下文不符");
+                    Log("PASS same-body-different-occurrences incoming=2 confirmed=2 peer=2 own-filtered=2" +
+                        (mock == null ? "" : " model=mock-http context-turns=2"));
                 }
             }
             finally { core.StopUnsubmitted(); }

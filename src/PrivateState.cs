@@ -22,6 +22,11 @@ public sealed class PrivateEvent
     public PrivatePhase Phase;
 }
 
+public sealed class PrivateModelTurn
+{
+    public string User, Assistant;
+}
+
 public sealed class PrivateState
 {
     public int Schema = 1;
@@ -29,6 +34,7 @@ public sealed class PrivateState
     public PrivateEvent[] Events = new PrivateEvent[0];
     public string[] Snapshot = new string[0];
     public string SnapshotEpoch;
+    public PrivateModelTurn[] ModelTurns = new PrivateModelTurn[0];
 }
 
 internal sealed class PrivateStore : IDisposable
@@ -87,6 +93,12 @@ internal sealed class PrivateStore : IDisposable
     {
         item.Phase = phase;
         item.Detail = detail;
+        Save();
+    }
+
+    internal void ClearModelContext()
+    {
+        State.ModelTurns = new PrivateModelTurn[0];
         Save();
     }
 
