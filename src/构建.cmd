@@ -15,11 +15,11 @@ if not exist "%OUT%\." mkdir "%OUT%" || exit /b 1
 pushd "%~dp0" || exit /b 1
 if /i "%~1"=="--checks" goto checks
 
-"%NET%\csc.exe" /nologo /codepage:65001 /target:winexe /win32icon:"assets\launcher.ico" /resource:"assets\launcher.ico",QQPrivateApp.LauncherIcon /out:"%OUT%\启动器.exe" /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:Accessibility.dll /r:System.Security.dll /r:System.Net.Http.dll /r:System.Runtime.Serialization.dll /r:"%NET%\WPF\WindowsBase.dll" /r:"%NET%\WPF\UIAutomationClient.dll" /r:"%NET%\WPF\UIAutomationTypes.dll" *.cs
+"%NET%\csc.exe" /nologo /codepage:65001 /target:winexe /win32icon:"assets\launcher.ico" /resource:"assets\launcher.ico",QQPrivateApp.LauncherIcon /out:"%OUT%\Ivy connect.exe" /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:Accessibility.dll /r:System.Security.dll /r:System.Net.Http.dll /r:System.Runtime.Serialization.dll /r:"%NET%\WPF\WindowsBase.dll" /r:"%NET%\WPF\UIAutomationClient.dll" /r:"%NET%\WPF\UIAutomationTypes.dll" *.cs
 if errorlevel 1 goto failure
 "%NET%\csc.exe" /nologo /codepage:65001 /target:exe /out:"%OUT%\QQWindowLab.Cli.exe" /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:Accessibility.dll /r:System.Security.dll /r:System.Net.Http.dll /r:System.Runtime.Serialization.dll /r:"%NET%\WPF\WindowsBase.dll" /r:"%NET%\WPF\UIAutomationClient.dll" /r:"%NET%\WPF\UIAutomationTypes.dll" *.cs
 if errorlevel 1 goto failure
-copy /y "%~dp0App.config" "%OUT%\启动器.exe.config" > nul
+copy /y "%~dp0App.config" "%OUT%\Ivy connect.exe.config" > nul
 if errorlevel 1 goto failure
 copy /y "%~dp0App.config" "%OUT%\QQWindowLab.Cli.exe.config" > nul
 if errorlevel 1 goto failure
@@ -53,6 +53,10 @@ if not "%errorlevel%"=="0" goto failure
 "%NET%\csc.exe" /nologo /codepage:65001 /target:exe /main:NumericPresentationChecks /out:"%OUT%\NumericPresentationChecks.exe" /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:Accessibility.dll /r:System.Security.dll /r:System.Net.Http.dll /r:System.Runtime.Serialization.dll /r:"%NET%\WPF\WindowsBase.dll" /r:"%NET%\WPF\UIAutomationClient.dll" /r:"%NET%\WPF\UIAutomationTypes.dll" *.cs "tests\NumericPresentationChecks.cs"
 if errorlevel 1 goto failure
 "%OUT%\NumericPresentationChecks.exe"
+if not "%errorlevel%"=="0" goto failure
+"%NET%\csc.exe" /nologo /codepage:65001 /target:exe /main:ReceiptChecks /out:"%OUT%\ReceiptChecks.exe" /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:Accessibility.dll /r:System.Security.dll /r:System.Net.Http.dll /r:System.Runtime.Serialization.dll /r:"%NET%\WPF\WindowsBase.dll" /r:"%NET%\WPF\UIAutomationClient.dll" /r:"%NET%\WPF\UIAutomationTypes.dll" *.cs "tests\ReceiptChecks.cs"
+if errorlevel 1 goto failure
+"%OUT%\ReceiptChecks.exe"
 if not "%errorlevel%"=="0" goto failure
 popd
 exit /b 0

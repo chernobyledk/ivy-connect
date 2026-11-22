@@ -79,9 +79,9 @@ internal sealed class PrivateRunControl : IDisposable
         lock (gate)
         {
             Check(capturedRevision);
-            record();
-            Check(capturedRevision);
             prepare();
+            Check(capturedRevision);
+            record();
             Check(capturedRevision);
             submit();
         }
@@ -104,6 +104,7 @@ internal sealed class PrivateReplyCore
     private readonly Predicate<ReplyRow> permitted;
     private readonly Action<string> log;
     private readonly int confirmationMilliseconds;
+    private readonly Action<string> progress;
     private readonly string bindingVersion;
     private readonly Stopwatch sessionClock = Stopwatch.StartNew();
     internal bool RecoveryBlocked { get; private set; }
@@ -111,7 +112,8 @@ internal sealed class PrivateReplyCore
     internal int OwnIgnored { get; private set; }
 
     internal PrivateReplyCore(PrivateStore store, IPrivateTransport wire, IPrivateReplyProvider provider,
-        PrivateRunControl control, Predicate<ReplyRow> permitted, Action<string> log, int confirmationMilliseconds = 14000)
+        PrivateRunControl control, Predicate<ReplyRow> permitted, Action<string> log, int confirmationMilliseconds = 18000,
+        Action<string> progress = null)
     {
         this.store = store;
         this.wire = wire;
@@ -120,6 +122,7 @@ internal sealed class PrivateReplyCore
         this.permitted = permitted;
         this.log = log;
         this.confirmationMilliseconds = confirmationMilliseconds;
+        this.progress = progress ?? (_ => { });
         if (store.State.Binding == null) throw new InvalidOperationException("请先核验并绑定 QQ 私聊");
         bindingVersion = store.State.Binding.RouteStamp();
     }
@@ -147,15 +150,12 @@ internal sealed class PrivateReplyCore
             " exact-runtime-evidence-overlap=" + positionMatches + " offline-backfill=no");
         foreach (var item in store.State.Events)
         {
-            if (item.Phase == PrivatePhase.SubmitIntent || item.Phase == PrivatePhase.Uncertain)
+            if (PrivateStore.IsPending(item))
             {
-                var match = !String.IsNullOrEmpty(item.RecoveryTag) &&
-                    (item.BindingVersion == null || item.BindingVersion == bindingVersion) && store.State.SnapshotEpoch == wire.Epoch &&
-                    positionMatches != 0 && item.BotQq == bot && item.PeerQq == peer &&
-                    current.Any(row => row.Own == false && row.Key == item.RuntimeKey && row.Digest == item.Digest) &&
-                    HasReply(current, item);
-                Change(item, match ? PrivatePhase.LocalConfirmed : PrivatePhase.Uncertain,
-                    match ? "restart-found-unique-outgoing-tag" : "restart-no-reliable-match-no-resend");
+                string reason;
+                var match = ReceiptReview.Find(store, wire, item, control.Token, 0, progress, out reason);
+                if (match) ConfirmLocal(item, reason);
+                else if (item.Phase == PrivatePhase.SubmitIntent) Change(item, PrivatePhase.Uncertain, "重启后仍未核实提交。" + reason);
                 RecoveryBlocked |= !match;
             }
             else if (PrivateStore.IsUnsubmitted(item))
@@ -182,6 +182,13 @@ internal sealed class PrivateReplyCore
     {
         store.Set(item, phase, detail);
         log("local-id=" + item.LocalId + " phase=" + phase + " detail=" + detail);
+    }
+
+    private void ConfirmLocal(PrivateEvent item, string detail)
+    {
+        store.ConfirmLocal(item, detail);
+        log("local-id=" + item.LocalId + " phase=LocalConfirmed detail=" + detail);
+        Timing(item, "local-confirm");
     }
 
     internal void Tick()
@@ -261,29 +268,6 @@ internal sealed class PrivateReplyCore
         log("timing id=" + item.LocalId + " stage=" + stage + " mono-ms=" + sessionClock.ElapsedMilliseconds);
     }
 
-    private static bool HasReply(ReplyRow[] rows, PrivateEvent item)
-    {
-        if (String.IsNullOrEmpty(item.Reply)) return false;
-        var matches = rows.Where(row => row.Text == MessageSnapshot.Normalize(item.Reply)).ToArray();
-        return matches.Length == 1 && matches[0].Own == true;
-    }
-
-    private static bool HasNewReply(ReplyRow[] before, ReplyRow[] current, PrivateEvent item)
-    {
-        int tail = Array.FindIndex(current, row => row.Anchor == before[before.Length - 1].Anchor);
-        int overlap = Math.Min(tail + 1, before.Length);
-        if (overlap < Math.Min(2, before.Length))
-            throw new InvalidOperationException("提交前的消息尾部已变化，不能确认新气泡");
-        for (int i = 0; i < overlap; i++)
-            if (current[tail - i].Anchor != before[before.Length - 1 - i].Anchor)
-                throw new InvalidOperationException("提交前后的气泡顺序无法核对");
-        var expected = MessageSnapshot.Normalize(item.Reply);
-        var hits = current.Skip(tail + 1).Where(row => row.Own == true && row.Text == expected).ToArray();
-        if (hits.Length > 1 || hits.Any(hit => before.Any(row => row.Key == hit.Key)))
-            throw new InvalidOperationException("新出站气泡不唯一或重复使用标识");
-        return hits.Length == 1;
-    }
-
     private ReplyDraft Generate(PrivateEvent item, int revision)
     {
         using (var request = CancellationTokenSource.CreateLinkedTokenSource(control.Token))
@@ -326,7 +310,6 @@ internal sealed class PrivateReplyCore
             control.Check(revision);
             RequireRoute(item.BotQq, item.PeerQq);
             Timing(item, "identity-before-model");
-            int contextLimit = 0;
             if (item.Phase == PrivatePhase.Queued)
             {
                 generationStarted = true;
@@ -339,15 +322,23 @@ internal sealed class PrivateReplyCore
                 item.Reply = draft.Text;
                 item.RecoveryTag = draft.RecoveryTag == "[local:" + item.LocalId + "]" &&
                     draft.Text.EndsWith(draft.RecoveryTag, StringComparison.Ordinal) ? draft.RecoveryTag : null;
-                contextLimit = draft.ModelContextLimit;
+                item.ContextLimit = draft.ModelContextLimit;
                 Change(item, PrivatePhase.Generated, "reply-provider");
             }
             ReplyRow[] before = null;
             Change(item, PrivatePhase.Preparing, "before-editor-write");
             var checkedWire = wire as ICheckedPrivateTransport;
             Action<Action, Action> submitChecked = (prepare, submit) => control.Commit(revision,
-                () => Change(item, PrivatePhase.SubmitIntent, "durable-before-default-action"),
-                prepare, () => { crossed = true; Timing(item, "submit"); submit(); });
+                () => {
+                    item.Submission = ReceiptReview.Capture(wire.Epoch, before);
+                    Change(item, PrivatePhase.SubmitIntent, "durable-tail-before-default-action");
+                },
+                prepare, () => {
+                    crossed = true;
+                    Timing(item, "submit");
+                    submit();
+                    item.Submission.ReturnedUtc = PrivateStore.Stamp();
+                });
             if (checkedWire != null)
                 checkedWire.SubmitChecked(item.Reply, rows => { VerifyRows(item, revision, true, rows); before = rows; },
                     submitChecked, checkpoint => Timing(item, checkpoint));
@@ -357,27 +348,10 @@ internal sealed class PrivateReplyCore
                 wire.RequireReady();
                 wire.Submit(item.Reply, () => before = Verify(item, revision, true), submit => submitChecked(() => { }, submit));
             }
-            var until = System.Diagnostics.Stopwatch.StartNew();
-            do
-            {
-                bool draftEmpty = true;
-                var rows = checkedWire == null ? wire.Read() : checkedWire.ReadAfterSubmit(out draftEmpty);
-                try { timeline.CheckSameConversation(rows); }
-                catch (InvalidOperationException) { throw new PrivateRouteLostException("提交后原会话锚点消失，发送结果待确认"); }
-                if (HasNewReply(before, rows, item) && draftEmpty)
-                {
-                    if (checkedWire == null) wire.RequireReady();
-                    if (contextLimit > 0)
-                        store.State.ModelTurns = ModelReplyContext.Recent(store.State.ModelTurns.Concat(new[] {
-                            new PrivateModelTurn { User = item.Body, Assistant = item.Reply }
-                        }), contextLimit).ToArray();
-                    Change(item, PrivatePhase.LocalConfirmed, "unique-new-outgoing-bubble-and-empty-draft");
-                    Timing(item, "local-confirm");
-                    return;
-                }
-                Wait(230);
-            } while (until.ElapsedMilliseconds < confirmationMilliseconds);
-            throw new InvalidOperationException("已提交但没有确认唯一的回执气泡");
+            string reason;
+            if (!ReceiptReview.Find(store, wire, item, control.Token, confirmationMilliseconds, progress, out reason))
+                throw new PrivateRouteLostException(reason);
+            ConfirmLocal(item, reason);
         }
         catch (PrivatePausedException)
         {
@@ -391,10 +365,11 @@ internal sealed class PrivateReplyCore
         }
         catch (Exception ex)
         {
+            if (item.Phase == PrivatePhase.LocalConfirmed) throw;
             if (crossed)
             {
-                Change(item, PrivatePhase.Uncertain, "submission-started-no-retry");
                 RecoveryBlocked = true;
+                Change(item, PrivatePhase.Uncertain, ex is PrivateRouteLostException ? ex.Message : "已开始提交，结果尚无证据。请重新核查。");
             }
             else
                 Change(item, ex is OperationCanceledException ? PrivatePhase.Cancelled : PrivatePhase.Failed,

@@ -31,13 +31,15 @@ internal sealed class PrivateCoreForm : Form
     private readonly Button closeCover = new Button { Text = "关闭遮罩", AutoSize = true };
     private readonly Button chooseCover = new Button { Text = "选择遮罩图片", AutoSize = true };
     private readonly Button resetCover = new Button { Text = "恢复默认图片", AutoSize = true };
+    private readonly Button recheckReceipt = new Button { Text = "重新核查", AutoSize = true };
+    private readonly Button markPeerReceipt = new Button { Text = "确认对方已收到", AutoSize = true };
     private readonly Label boundChat = new Label { Dock = DockStyle.Top, Height = 26, Padding = new Padding(8, 5, 0, 0) };
     private readonly Label coverStatus = new Label { Dock = DockStyle.Bottom, Height = 25, Padding = new Padding(8, 4, 0, 0) };
     private readonly BindingPromptPanel bindPrompt = new BindingPromptPanel();
     private readonly PictureCoverController pictureCover;
     private readonly Icon launcherIcon;
     private readonly QqPlacement placement = new QqPlacement();
-    private readonly NotifyIcon tray = new NotifyIcon { Text = "QQ 单私聊回复" };
+    private readonly NotifyIcon tray = new NotifyIcon { Text = "Ivy connect" };
     private readonly ComboBox mode = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 95 };
     private readonly object logGate = new object();
     private PrivateRunControl run;
@@ -54,12 +56,12 @@ internal sealed class PrivateCoreForm : Form
     {
         this.folder = folder;
         this.acceptIncoming = acceptIncoming ?? (_ => true);
-        Text = "QQ 自动回复 · 单私聊 AI v" + Application.ProductVersion;
+        Text = "Ivy connect v" + Application.ProductVersion;
         launcherIcon = PresentationAssets.ReadIcon();
         Icon = launcherIcon;
         tray.Icon = launcherIcon;
-        ClientSize = new Size(690, 625);
-        MinimumSize = new Size(620, 650);
+        ClientSize = new Size(720, 665);
+        MinimumSize = new Size(640, 680);
         StartPosition = FormStartPosition.CenterScreen;
         var grid = new TableLayoutPanel { Dock = DockStyle.Top, Height = 177, Padding = new Padding(8),
             ColumnCount = 2, RowCount = 5, GrowStyle = TableLayoutPanelGrowStyle.FixedSize };
@@ -90,10 +92,13 @@ internal sealed class PrivateCoreForm : Form
         location.Controls.AddRange(new Control[] { findQq, pickQq, showQq, sideQq, restoreQq, advanced });
         var masks = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 37, Padding = new Padding(6, 1, 6, 0) };
         masks.Controls.AddRange(new Control[] { showCover, closeCover, chooseCover, resetCover });
+        var receipts = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 36, Padding = new Padding(6, 1, 6, 0) };
+        receipts.Controls.AddRange(new Control[] { recheckReceipt, markPeerReceipt });
         Controls.Add(status);
         Controls.Add(buttons);
         Controls.Add(location);
         Controls.Add(masks);
+        Controls.Add(receipts);
         Controls.Add(coverStatus);
         Controls.Add(bindPrompt);
         Controls.Add(diagnostics);
@@ -111,6 +116,7 @@ internal sealed class PrivateCoreForm : Form
                 var p = store.State.Binding;
                 if (p != null)
                 {
+                    ReadLegacySubmissionTime(store.State.Events.FirstOrDefault(PrivateStore.IsPending));
                     var saved = new[] { p.BotQq, p.PeerQq, p.BotDisplay, p.PeerDisplay };
                     for (int i = 0; i < saved.Length; i++) fields[i].Text = saved[i];
                     DisplayBinding(p, false);
@@ -133,6 +139,8 @@ internal sealed class PrivateCoreForm : Form
         closeCover.Click += (s, e) => pictureCover.Close();
         chooseCover.Click += (s, e) => ChoosePicture();
         resetCover.Click += (s, e) => ChangePicture(() => pictureCover.Reset());
+        recheckReceipt.Click += async (s, e) => await CheckPendingReceipt();
+        markPeerReceipt.Click += (s, e) => ConfirmPeerReceipt();
         var menu = new ContextMenuStrip();
         menu.Items.Add("显示控制窗", null, (s, e) => ShowControl());
         menu.Items.Add("停止自动回复", null, (s, e) => RequestStop());
@@ -400,9 +408,112 @@ internal sealed class PrivateCoreForm : Form
     private static string Summary(PrivateStore store, string head)
     {
         var events = store.State.Events;
+        var pending = events.FirstOrDefault(PrivateStore.IsPending);
         return head + Environment.NewLine + "观察 " + events.Length + " · 本地确认 " +
-            events.Count(x => x.Phase == PrivatePhase.LocalConfirmed) + " · 待确认 " +
-            events.Count(x => x.Phase == PrivatePhase.Uncertain || x.Phase == PrivatePhase.SubmitIntent);
+            events.Count(x => x.Phase == PrivatePhase.LocalConfirmed) + " · 对方确认 " +
+            events.Count(x => !String.IsNullOrEmpty(x.PeerConfirmedUtc)) + " · 待确认 " + events.Count(PrivateStore.IsPending) +
+            " · 明确失败 " + events.Count(x => x.Phase == PrivatePhase.Failed) + " · 取消 " + events.Count(x => x.Phase == PrivatePhase.Cancelled) +
+            (pending == null ? "" : Environment.NewLine + ReceiptDescription(store.State.Binding, pending) + Environment.NewLine +
+            "请点「重新核查」，或到对方客户端核对后点「确认对方已收到」。");
+    }
+
+    private static string ReceiptDescription(PrivateBindingProof proof, PrivateEvent item)
+    {
+        var reply = (item.Reply ?? "").Trim().Replace('\r', ' ').Replace('\n', ' ');
+        if (reply.Length > 110) reply = reply.Substring(0, 110) + "…";
+        var time = item.Submission == null ? item.LegacySubmittedUtc : item.Submission.IntentUtc;
+        DateTimeOffset stamp;
+        var moment = DateTimeOffset.TryParse(time ?? item.ObservedUtc, out stamp) ? stamp.ToLocalTime().ToString("MM-dd HH:mm:ss") : "时间不详";
+        string cause = item.Detail == "restart-no-reliable-match-no-resend" || item.Detail == "submission-started-no-retry" ?
+            "旧版未找到足够的出站确认依据" : item.Detail == "durable-tail-before-default-action" || item.Detail == "durable-before-default-action" ?
+            "提交窗口内程序退出，动作结果未核实" : item.Detail;
+        var recipient = proof != null && proof.PeerQq == item.PeerQq ? proof.PeerDisplay + "（" + item.PeerQq + "）" : item.PeerQq;
+        return "任务 " + item.LocalId + " · " + recipient + " · " + (time == null ? "观察 " : "提交前记录 ") + moment +
+            "\r\n回复摘要　" + reply + "\r\n待核查原因　" + cause;
+    }
+
+    private void ReadLegacySubmissionTime(PrivateEvent item)
+    {
+        if (item == null || item.Submission != null || !String.IsNullOrEmpty(item.LegacySubmittedUtc)) return;
+        try
+        {
+            var logPath = Path.Combine(folder, "app.log");
+            if (!File.Exists(logPath)) return;
+            var needle = "timing id=" + item.LocalId + " stage=submit ";
+            var proof = File.ReadLines(logPath).Where(line => line.Contains(needle)).Take(2).ToArray();
+            DateTimeOffset timestamp;
+            if (proof.Length == 1 && DateTimeOffset.TryParse(proof[0].Split(' ')[0], out timestamp))
+                item.LegacySubmittedUtc = timestamp.ToString("O");
+        }
+        catch (IOException) { }
+    }
+
+    private async Task CheckPendingReceipt()
+    {
+        connecting = true;
+        using (var cancel = new CancellationTokenSource())
+        {
+            discovery = cancel;
+            UpdateButtons();
+            try
+            {
+                SetConnection("只读核查", "正在核验原私聊和待确认任务…");
+                var message = await Task.Run(() => {
+                    using (var store = new PrivateStore(folder))
+                    {
+                        var item = store.State.Events.FirstOrDefault(PrivateStore.IsPending);
+                        if (item == null) return Summary(store, "没有待确认的任务。");
+                        ReadLegacySubmissionTime(item);
+                        var proof = store.State.Binding;
+                        if (proof == null || proof.PeerQq != item.PeerQq || proof.BotQq != item.BotQq)
+                            return Summary(store, "请恢复任务的原账号和原私聊，再核查。");
+                        var result = QqConnection.Resolve(proof, QqConnection.Collect(proof, cancel.Token.ThrowIfCancellationRequested, Log), true);
+                        if (result.Binding == null) return Summary(store, result.Detail);
+                        using (var wire = new QqPrivateTransport(result.Binding, cancel.Token.ThrowIfCancellationRequested, Log, true))
+                        {
+                            string reason;
+                            if (!ReceiptReview.Find(store, wire, item, cancel.Token, 14000,
+                                text => BeginInvoke(new Action(() => status.Text = text)), out reason)) return Summary(store, reason);
+                            cancel.Token.ThrowIfCancellationRequested();
+                            store.ConfirmLocal(item, reason);
+                            Log("local-id=" + item.LocalId + " phase=LocalConfirmed source=read-only-recheck detail=" + reason);
+                            return Summary(store, "已核查到本地新出站气泡。可重新连接后点击「开始回复」。");
+                        }
+                    }
+                }, cancel.Token);
+                SetConnection("已完成核查", message);
+            }
+            catch (OperationCanceledException) { SetConnection("未连接", "已取消核查，原任务已保留。"); }
+            catch (Exception ex) { SetConnection("核查暂停", ModelConfigForm.DisplayError(ex)); }
+            finally { discovery = null; connecting = false; Finished(); }
+        }
+    }
+
+    private void ConfirmPeerReceipt()
+    {
+        PrivateEvent pending;
+        string evidence;
+        try
+        {
+            using (var store = new PrivateStore(folder))
+            {
+                pending = store.State.Events.FirstOrDefault(PrivateStore.IsPending);
+                if (pending == null) { SetConnection("未连接", "没有待确认的任务。"); return; }
+                ReadLegacySubmissionTime(pending);
+                evidence = ReceiptDescription(store.State.Binding, pending);
+            }
+            if (MessageBox.Show(this, evidence + "\r\n\r\n请确认你已在对方 QQ 客户端看到这条具体回复。确认后只登记收件记录。",
+                "Ivy connect · 人工收件确认", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            using (var store = new PrivateStore(folder))
+            {
+                var item = store.State.Events.Single(row => row.LocalId == pending.LocalId);
+                item.LegacySubmittedUtc = pending.LegacySubmittedUtc;
+                store.ConfirmPeer(item);
+                Log("local-id=" + item.LocalId + " receipt=peer-confirmed source=" + item.PeerReceiptSource);
+                SetConnection("已登记对方收件", Summary(store, "已记录人工收件确认。请重新连接原私聊，再点击「开始回复」。"));
+            }
+        }
+        catch (Exception ex) { SetConnection("收件登记未完成", ModelConfigForm.DisplayError(ex)); }
     }
     private string ModelPath { get { return Path.Combine(folder, "model-settings.dpapi"); } }
     private void UpdateButtons()
@@ -411,6 +522,7 @@ internal sealed class PrivateCoreForm : Form
         bind.Enabled = start.Enabled = attested.Enabled = configure.Enabled = clearContext.Enabled = mode.Enabled = idle;
         foreach (var field in fields) field.Enabled = idle;
         findQq.Enabled = pickQq.Enabled = sideQq.Enabled = idle;
+        recheckReceipt.Enabled = markPeerReceipt.Enabled = idle;
         showQq.Enabled = restoreQq.Enabled = showCover.Enabled = !connecting && enrollment == null;
         pause.Enabled = run != null && !run.Token.IsCancellationRequested;
         stop.Enabled = !idle;
@@ -562,9 +674,10 @@ internal sealed class PrivateCoreForm : Form
             using (var transport = new QqPrivateTransport(proof, active.Token.ThrowIfCancellationRequested, Log))
             {
                 IPrivateReplyProvider reply = modelReply == null ? (IPrivateReplyProvider)new FixedPrivateReply(item => "已收到，谢谢。") : modelReply;
-                var core = new PrivateReplyCore(store, transport, reply, active, acceptIncoming, Log);
+                var core = new PrivateReplyCore(store, transport, reply, active, acceptIncoming, Log,
+                    progress: text => Report(text, "核查中"));
                 core.Start(proof.BotQq, proof.PeerQq);
-                if (core.RecoveryBlocked) return Summary(store, "上次已提交的回复待确认，发送保持停止");
+                if (core.RecoveryBlocked) return Summary(store, "已有提交需要核实，新的发送保持暂停。");
                 Report(Summary(store, "监听已绑定私聊"), "运行中");
                 try
                 {

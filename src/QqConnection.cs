@@ -57,7 +57,7 @@ internal sealed class QqCandidate
 {
     internal Target Target;
     internal long Window;
-    internal string Login, Chat, HeaderProof, LoginProof, Epoch;
+    internal string Login, Chat, HeaderProof, LoginProof, ConversationProof, Epoch;
     internal bool Visible, Minimized, Enabled, LoginPrompt, ReadFailed, EditorReady, HasDraft, NetworkWarning, AnchorMatches;
 
     internal bool CanVerify(string botDisplay, string chatDisplay)
@@ -162,7 +162,7 @@ internal static class QqConnection
             {
                 var ui = Controls.Scan(target, true);
                 row.AnchorMatches = false;
-                row.HeaderProof = row.LoginProof = null;
+                row.HeaderProof = row.LoginProof = row.ConversationProof = null;
                 row.Login = ui.ConnectionLoginDisplay();
                 row.Chat = ui.HeaderIdentity();
                 row.LoginPrompt = row.Login == null && row.Chat == null && ui.ShowsLoginPrompt();
@@ -175,7 +175,11 @@ internal static class QqConnection
                     if (row.Login == null && row.LoginProof != null && row.LoginProof == prior.LoginProof)
                         row.Login = prior.BotDisplay; // prior run-time avatar evidence is stronger than a display label
                     if (row.HeaderProof == prior.HeaderProof && row.LoginProof == prior.LoginProof && !String.IsNullOrEmpty(prior.ChallengeAnchor))
-                        row.AnchorMatches = ui.ReplyRows().Count(r => r.Own == false && MessageSnapshot.Hash(r.Anchor) == prior.ChallengeAnchor) == 1;
+                    {
+                        row.ConversationProof = ui.SelectedConversationProof();
+                        if (String.IsNullOrEmpty(prior.ConversationProof))
+                            row.AnchorMatches = ui.ReplyRows().Count(r => r.Own == false && MessageSnapshot.Hash(r.Anchor) == prior.ChallengeAnchor) == 1;
+                    }
                 }
                 row.HasDraft = row.EditorReady && prior != null && row.Login == prior.BotDisplay &&
                     row.Chat == prior.PeerDisplay && !ui.EmptyDraft();
@@ -201,10 +205,11 @@ internal static class QqConnection
         return !row.ReadFailed && row.Visible && !row.Minimized && row.Enabled &&
             SameProcess(prior.Epoch, row.Epoch) && row.Login == prior.BotDisplay && row.Chat == prior.PeerDisplay &&
             !String.IsNullOrEmpty(prior.LoginProof) && row.LoginProof == prior.LoginProof &&
-            !String.IsNullOrEmpty(prior.HeaderProof) && row.HeaderProof == prior.HeaderProof && row.AnchorMatches;
+            !String.IsNullOrEmpty(prior.HeaderProof) && row.HeaderProof == prior.HeaderProof &&
+            (String.IsNullOrEmpty(prior.ConversationProof) ? row.AnchorMatches : row.ConversationProof == prior.ConversationProof);
     }
 
-    internal static QqConnectionResult Resolve(PrivateBindingProof prior, QqCandidate[] rows)
+    internal static QqConnectionResult Resolve(PrivateBindingProof prior, QqCandidate[] rows, bool receiptOnly = false)
     {
         if (rows.Length == 0) return new QqConnectionResult(QqConnectState.NotConnected, "未发现 QQ 窗口。请打开 QQ 并登录。", rows);
         if (prior == null)
@@ -220,15 +225,17 @@ internal static class QqConnection
         {
             var match = proven[0];
             if (match.NetworkWarning) return new QqConnectionResult(QqConnectState.Reconnecting, "QQ 显示断线或正在重连。网络恢复后再重试。", rows);
-            if (!match.EditorReady) return new QqConnectionResult(QqConnectState.Unreadable, "已识别原私聊，输入框或发送按钮暂不可用。", rows);
-            if (match.HasDraft) return new QqConnectionResult(QqConnectState.Draft, "原私聊内有草稿。请先由本人处理草稿，再开始回复。", rows);
+            if (!receiptOnly && !match.EditorReady) return new QqConnectionResult(QqConnectState.Unreadable, "已识别原私聊，输入框或发送按钮暂不可用。", rows);
+            if (!receiptOnly && match.HasDraft) return new QqConnectionResult(QqConnectState.Draft, "原私聊内有草稿。请先由本人处理草稿，再开始回复。", rows);
             var hwnd = match.Window;
-            if (prior.Window == hwnd && prior.Epoch == match.Epoch)
+            var sameWindow = prior.Window == hwnd && prior.Epoch == match.Epoch;
+            if (sameWindow && (receiptOnly || prior.ConversationProof == match.ConversationProof))
                 return new QqConnectionResult(QqConnectState.Ready, "已找到并核验原私聊。", rows, prior);
             return new QqConnectionResult(QqConnectState.Ready, "已重新定位原私聊。", rows, new PrivateBindingProof {
                 BotQq = prior.BotQq, PeerQq = prior.PeerQq, BotDisplay = prior.BotDisplay, PeerDisplay = prior.PeerDisplay,
                 Window = hwnd, Epoch = match.Epoch, LoginProof = prior.LoginProof, HeaderProof = prior.HeaderProof,
-                ChallengeAnchor = prior.ChallengeAnchor, VerifiedUtc = prior.VerifiedUtc, Version = Guid.NewGuid().ToString("N") });
+                ChallengeAnchor = prior.ChallengeAnchor, ConversationProof = match.ConversationProof,
+                VerifiedUtc = prior.VerifiedUtc, Version = sameWindow ? prior.Version : Guid.NewGuid().ToString("N") });
         }
 
         var sameChat = rows.Where(row => row.Visible && !row.Minimized && row.Enabled && !row.ReadFailed &&
@@ -240,7 +247,7 @@ internal static class QqConnection
             if (sameChat[0].NetworkWarning) return new QqConnectionResult(QqConnectState.Reconnecting, "QQ 显示断线或正在重连。", rows);
             if (sameChat[0].HasDraft) return new QqConnectionResult(QqConnectState.Draft, "请处理私聊中的草稿后再核验。", rows);
             return new QqConnectionResult(QqConnectState.NeedsVerification,
-                "找到了显示名相符的私聊，但窗口或原入站验证记录已经变化。请核对双方资料卡并重新核验。", rows);
+                "找到了显示名相符的私聊，但当前选中会话或旧验证证据不匹配。请核对双方资料卡并重新核验。", rows);
         }
         var saved = rows.FirstOrDefault(row => row.Epoch == prior.Epoch);
         if (saved != null && saved.Minimized) return new QqConnectionResult(QqConnectState.Minimized,

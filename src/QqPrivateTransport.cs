@@ -23,7 +23,7 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
     }
     public string Epoch { get { return EpochOf(target); } }
 
-    internal QqPrivateTransport(PrivateBindingProof proof, Action guard, Action<string> log)
+    internal QqPrivateTransport(PrivateBindingProof proof, Action guard, Action<string> log, bool receiptOnly = false)
     {
         this.proof = proof;
         this.guard = guard;
@@ -33,7 +33,8 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
         if (Epoch != proof.Epoch) throw new PrivateRouteLostException("QQ 窗口或进程代际已变化，请重新按号核验");
         RequireWindow();
         binding = ReadStable(() => new Binding(target, false, true));
-        Read();
+        if (receiptOnly) ReadStable(() => BoundRows(Scan(false)));
+        else Read();
         windowLease = new Mutex(false, @"Local\QQWindowLab.Continuous." + target.Hwnd.ToInt64());
         bool owns;
         try { owns = windowLease.WaitOne(0); }
@@ -41,14 +42,14 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
         if (!owns) { windowLease.Dispose(); throw new InvalidOperationException("该 QQ 窗口已有另一个收发进程"); }
     }
 
-    private Controls Scan()
+    private Controls Scan(bool needEditor = true)
     {
         guard();
         RequireWindow();
         var ui = Controls.Scan(target, true);
         RequireLiveIdentity(ui);
         if (ui.HasVisibleConnectionWarning()) throw new InvalidOperationException("QQ 界面显示断线或重新连接");
-        if (!ui.HasMessageArea || ui.Editor == null || !ui.Editor.Current.IsEnabled || ui.Button == null)
+        if (!ui.HasMessageArea || (needEditor && (ui.Editor == null || !ui.Editor.Current.IsEnabled || ui.Button == null)))
             throw new PrivateRouteLostException("QQ 消息或编辑控件已失效，请重新核验");
         guard();
         return ui;
@@ -65,15 +66,16 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
     private void RequireLiveIdentity(Controls ui)
     {
         if (!binding.Matches(ui) || binding.HeaderProof != proof.HeaderProof || ui.HeaderIdentity() != proof.PeerDisplay ||
-            String.IsNullOrEmpty(proof.LoginProof) || ui.LoginEvidence(proof.BotDisplay) != proof.LoginProof)
+            String.IsNullOrEmpty(proof.LoginProof) || ui.LoginEvidence(proof.BotDisplay) != proof.LoginProof ||
+            (!String.IsNullOrEmpty(proof.ConversationProof) && ui.SelectedConversationProof() != proof.ConversationProof))
             throw new PrivateRouteLostException("登录账号或私聊界面证据变化，旧任务已停发");
     }
 
     private ReplyRow[] BoundRows(Controls ui)
     {
         var rows = ui.ReplyRows();
-        if (String.IsNullOrEmpty(proof.ChallengeAnchor) ||
-            rows.Count(row => row.Own == false && MessageSnapshot.Hash(row.Anchor) == proof.ChallengeAnchor) != 1)
+        if (String.IsNullOrEmpty(proof.ConversationProof) && (String.IsNullOrEmpty(proof.ChallengeAnchor) ||
+            rows.Count(row => row.Own == false && MessageSnapshot.Hash(row.Anchor) == proof.ChallengeAnchor) != 1))
             throw new PrivateRouteLostException("当前消息列表未找到唯一的原会话入站核验锚点，请重新核验");
         return rows;
     }
@@ -111,8 +113,13 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
     public ReplyRow[] ReadAfterSubmit(out bool draftEmpty)
     {
         var observed = ReadStable(() => {
-            var scene = Scan();
-            return Tuple.Create(BoundRows(scene), scene.EmptyDraft());
+            var scene = Scan(false);
+            var rows = BoundRows(scene);
+            bool empty = false;
+            try { empty = scene.Editor != null && scene.EmptyDraft(); }
+            catch (ElementNotAvailableException) { log("receipt draft unavailable; check bubble independently"); }
+            catch (COMException) { log("receipt draft unavailable; check bubble independently"); }
+            return Tuple.Create(rows, empty);
         });
         draftEmpty = observed.Item2;
         return observed.Item1;
@@ -161,6 +168,7 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
         }
         checkpoint("write-confirm");
         LegacyEditor.ILegacy action = null;
+        Controls submissionView = null;
         commit(() => {
             // Acquire the action only after durable intent and the final full, live route check.
             action = ReadStable(() => {
@@ -174,12 +182,14 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
                     String.IsNullOrWhiteSpace(legacy.CurrentDefaultAction()))
                     throw new InvalidOperationException("提交前草稿或发送按钮已变化，未发送");
                 RequireLiveIdentity(current);
+                submissionView = current;
                 return legacy;
             });
             checkpoint("identity-before-submit");
             RequireBackground();
         }, () => {
-            guard();
+            RequireBackground();
+            RequireLiveIdentity(submissionView);
             var hr = action.DoDefaultAction();
             log("send-return hr=0x" + hr.ToString("X8"));
         });
@@ -200,7 +210,7 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
             item.BotQq != proof.BotQq || item.PeerQq != proof.PeerQq ||
             !item.Reply.StartsWith("核心验证 ", StringComparison.Ordinal))
             throw new InvalidOperationException("非本轮已确认未提交的测试草稿");
-        var ui = ReadStable(Scan);
+        var ui = ReadStable(() => Scan());
         if (ui.EmptyDraft()) { log("cleanup editor already empty"); return; }
         if (ui.Draft() != item.Reply ||
             !ui.ReplyRows().Any(row => row.Own == false && row.Key == item.RuntimeKey && row.Digest == item.Digest))
@@ -271,7 +281,7 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
             if (String.IsNullOrEmpty(login) || ui.HeaderIdentity() != peerDisplay ||
                 ui.HasVisibleConnectionWarning() || !ui.EmptyDraft())
                 throw new InvalidOperationException("登录头像、聊天名称、网络或空草稿核验未通过");
-            return Tuple.Create(login, ui.ReplyRows());
+            return Tuple.Create(login, ui.ReplyRows(), ui.SelectedConversationProof());
         }, token.ThrowIfCancellationRequested, log);
         var timeline = new ReplyTimeline();
         var before = initial.Item2;
@@ -288,6 +298,7 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
             var snapshot = ReadStable(() => {
                 var ui = binding.RequireMatch();
                 if (ui.LoginEvidence(botDisplay) != initial.Item1 || ui.HeaderIdentity() != peerDisplay ||
+                    (initial.Item3 != null && ui.SelectedConversationProof() != initial.Item3) ||
                     ui.HasVisibleConnectionWarning() || !ui.EmptyDraft())
                     throw new InvalidOperationException("核验期间账号、会话、草稿或连接状态变化");
                 return ui.ReplyRows();
@@ -295,16 +306,16 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
             var hit = match(timeline.Advance(snapshot));
             if (hit == null) continue;
             checkAttempt();
-            return Capture(target, binding, bot, peer, botDisplay, peerDisplay, initial.Item1, MessageSnapshot.Hash(hit.Anchor));
+            return Capture(target, binding, bot, peer, botDisplay, peerDisplay, initial.Item1, MessageSnapshot.Hash(hit.Anchor), initial.Item3);
         }
     }
 
     private static PrivateBindingProof Capture(Target target, Binding binding, string bot, string peer,
-        string botDisplay, string peerDisplay, string login, string anchor)
+        string botDisplay, string peerDisplay, string login, string anchor, string conversation = null)
     {
         return new PrivateBindingProof { Window = target.Hwnd.ToInt64(), Epoch = EpochOf(target), Version = Guid.NewGuid().ToString("N"),
             BotQq = bot, PeerQq = peer, BotDisplay = botDisplay, PeerDisplay = peerDisplay,
-            HeaderProof = binding.HeaderProof, LoginProof = login, ChallengeAnchor = anchor,
+            HeaderProof = binding.HeaderProof, LoginProof = login, ChallengeAnchor = anchor, ConversationProof = conversation,
             VerifiedUtc = PrivateStore.Stamp() };
     }
 
@@ -330,7 +341,7 @@ internal sealed class QqPrivateTransport : IPrivateTransport, ICheckedPrivateTra
                     MessageSnapshot.Hash(row.Anchor) == fields["anchor"]))
                 throw new InvalidOperationException("上一轮按号核验锚点或登录头像已不可复核");
             return Capture(target, binding, fields["local"], fields["peer"], botDisplay, fields["header-label"],
-                avatar, fields["anchor"]);
+                avatar, fields["anchor"], ui.SelectedConversationProof());
         }
         finally { Array.Clear(clear, 0, clear.Length); }
     }

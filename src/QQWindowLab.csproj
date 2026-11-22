@@ -5,7 +5,7 @@
     <Platform Condition="'$(Platform)' == ''">AnyCPU</Platform>
     <ProjectGuid>{A169C076-E2B6-4C8B-AF7C-5B90B889C45C}</ProjectGuid>
     <OutputType>WinExe</OutputType>
-    <AssemblyName>启动器</AssemblyName>
+    <AssemblyName>Ivy connect</AssemblyName>
     <ApplicationIcon>assets\launcher.ico</ApplicationIcon>
     <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
     <PlatformTarget>AnyCPU</PlatformTarget>

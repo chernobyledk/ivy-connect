@@ -14,6 +14,7 @@ public sealed class PrivateBindingProof
 {
     public string BotQq, PeerQq, BotDisplay, PeerDisplay, HeaderProof, LoginProof, Epoch, ChallengeAnchor, VerifiedUtc;
     public string Version;
+    public string ConversationProof;
     public long Window;
 
     internal string RouteStamp()
@@ -27,6 +28,9 @@ public sealed class PrivateEvent
 {
     public string LocalId, BotQq, PeerQq, ObservedUtc, RuntimeKey, Digest, Body, Reply, RecoveryTag, Detail;
     public string BindingVersion;
+    public PrivateSubmissionEvidence Submission;
+    public string LocalConfirmedUtc, PeerConfirmedUtc, PeerReceiptSource, LegacySubmittedUtc;
+    public int ContextLimit;
     public PrivatePhase Phase;
 }
 
@@ -110,9 +114,49 @@ internal sealed class PrivateStore : IDisposable
 
     internal void Set(PrivateEvent item, PrivatePhase phase, string detail)
     {
+        var previous = item.Phase;
+        var previousDetail = item.Detail;
         item.Phase = phase;
         item.Detail = detail;
-        Save();
+        try { Save(); }
+        catch { item.Phase = previous; item.Detail = previousDetail; throw; }
+    }
+
+    internal static bool IsPending(PrivateEvent item)
+    {
+        return String.IsNullOrEmpty(item.PeerConfirmedUtc) &&
+            (item.Phase == PrivatePhase.Uncertain || item.Phase == PrivatePhase.SubmitIntent);
+    }
+
+    internal void ConfirmLocal(PrivateEvent item, string detail)
+    {
+        if (!IsPending(item)) throw new InvalidOperationException("此任务没有待核实的提交");
+        var previousTurns = State.ModelTurns;
+        var previousTime = item.LocalConfirmedUtc;
+        item.LocalConfirmedUtc = Stamp();
+        if (item.ContextLimit > 0)
+            State.ModelTurns = ModelReplyContext.Recent(State.ModelTurns.Concat(new[] {
+                new PrivateModelTurn { User = item.Body, Assistant = item.Reply }
+            }), item.ContextLimit).ToArray();
+        try { Set(item, PrivatePhase.LocalConfirmed, detail); }
+        catch { item.LocalConfirmedUtc = previousTime; State.ModelTurns = previousTurns; throw; }
+    }
+
+    internal void ConfirmPeer(PrivateEvent item)
+    {
+        var proof = State.Binding;
+        if (!IsPending(item) || proof == null || item.BotQq != proof.BotQq || item.PeerQq != proof.PeerQq || String.IsNullOrEmpty(item.Reply))
+            throw new InvalidOperationException("当前记录与待确认任务或原账号对不符");
+        var previousTurns = State.ModelTurns;
+        var previousSource = item.PeerReceiptSource;
+        item.PeerConfirmedUtc = Stamp();
+        item.PeerReceiptSource = "operator-reported-peer-client";
+        if (item.ContextLimit > 0)
+            State.ModelTurns = ModelReplyContext.Recent(State.ModelTurns.Concat(new[] {
+                new PrivateModelTurn { User = item.Body, Assistant = item.Reply }
+            }), item.ContextLimit).ToArray();
+        try { Save(); }
+        catch { item.PeerConfirmedUtc = null; item.PeerReceiptSource = previousSource; State.ModelTurns = previousTurns; throw; }
     }
 
     internal static bool IsUnsubmitted(PrivateEvent item)

@@ -49,7 +49,7 @@ internal sealed class PrivateLiveCheck : Form
         {
             var s = File.ReadAllLines(settings, Encoding.UTF8);
             if (s.Length < 8 || !Regex.IsMatch(s[6], "^[A-F0-9]{12}$") ||
-                !new[] { "send", "send-side", "restart", "restart-real", "recover", "cleanup", "send-model-mock", "send-model-real" }.Contains(s[7]) ||
+                !new[] { "send", "send-side", "send-receipt", "restart", "restart-real", "recover", "cleanup", "send-model-mock", "send-model-real" }.Contains(s[7]) ||
                 s.Length != (s[7] == "send-model-mock" || s[7] == "send-model-real" ? 9 : 8))
                 throw new InvalidOperationException("真机验证配置无效");
             if (s[7] == "send-model-mock")
@@ -100,7 +100,7 @@ internal sealed class PrivateLiveCheck : Form
             }
             await PrepareEditor(Target.FromKnownHandle(Int64.Parse(s[2])), s[3], s[4], "peer", control.Token, Log);
             await PrepareEditor(target, proof.PeerDisplay, proof.HeaderProof, "bot", control.Token, Log);
-            if (s[7] == "send-side" || s[7] == "send-model-real")
+            if (s[7] == "send-side" || s[7] == "send-model-real" || s[7] == "send-receipt")
             {
                 await Task.Run(() => QqConnection.VerifyUnique(proof, control.Token.ThrowIfCancellationRequested, Log), control.Token);
                 beforeMove = Native.Bounds(target.Hwnd);
@@ -270,6 +270,7 @@ internal sealed class PrivateLiveCheck : Form
     private void Verify(string[] s, string output, bool restart, PrivateBindingProof proof, Target target, Action guard)
     {
         var realModel = s[7] == "send-model-real" || s[7] == "restart-real";
+        var forceReceiptRestart = s[7] == "send-receipt";
         using (var store = new PrivateStore(output))
         using (var transport = new QqPrivateTransport(proof, guard, Log))
         using (var model = s[7] == "send-model-real" ? new DeepSeekPrivateReply(ModelSettingsFile.Load(s[8]), () => store.State.ModelTurns, Log) :
@@ -287,6 +288,11 @@ internal sealed class PrivateLiveCheck : Form
                 proof.PeerDisplay, "operator-verified-private-by-qq-number", s[2], s[3] });
             IPrivateReplyProvider provider = model == null ? (IPrivateReplyProvider)new FixedPrivateReply(item => "核心验证 " + s[6] + " 已收到") : model;
             IPrivateTransport selected = restart ? (IPrivateTransport)new ReadOnlyTransport(transport) : transport;
+            if (forceReceiptRestart)
+            {
+                provider = new UntaggedProofReply("Ivy 收发核对 " + s[6] + " 已收到");
+                selected = new InterruptSecondReceipt(transport);
+            }
             Func<int, string> prompts = number => number == 1 ?
                 "请记住暗号「梅雨36」，只回复「记住了」。编号" + s[6] :
                 "刚才的暗号是什么？只回复暗号。编号" + s[6];
@@ -325,7 +331,17 @@ internal sealed class PrivateLiveCheck : Form
                     guard();
                     if (driver != null)
                         driver.Poll(store.State.Events.Count(x => x.Phase == PrivatePhase.LocalConfirmed), guard);
-                    core.Tick();
+                    try { core.Tick(); }
+                    catch (PrivateRouteLostException)
+                    {
+                        var events = store.State.Events;
+                        if (!forceReceiptRestart || !core.RecoveryBlocked || events.Length != 2 || driver.Receipts != 1 ||
+                            events[0].Phase != PrivatePhase.LocalConfirmed || !PrivateStore.IsPending(events[1]) ||
+                            events[1].Submission == null || events[1].Submission.ReturnedUtc == null ||
+                            events[0].Digest != events[1].Digest || events[0].Reply != events[1].Reply) throw;
+                        Log("PASS first same-text reply confirmed; second real submission kept pending after injected post-submit read fault; no resend");
+                        return;
+                    }
                     if (restart && store.State.Events.Length != 2)
                         throw new InvalidOperationException("重启后重复创建了事件");
                     if (driver != null && driver.Receipts == 2 && core.OwnIgnored == 2) break;
@@ -367,6 +383,37 @@ internal sealed class PrivateLiveCheck : Form
         public void Submit(string text, Action verifyBefore, Action<Action> commit)
         {
             throw new InvalidOperationException("重启只读验证发现意外发送尝试");
+        }
+    }
+
+    private sealed class UntaggedProofReply : IPrivateReplyProvider
+    {
+        private readonly string text;
+        internal UntaggedProofReply(string text) { this.text = text; }
+        public Task<ReplyDraft> GenerateAsync(PrivateEvent item, CancellationToken cancel)
+        {
+            cancel.ThrowIfCancellationRequested();
+            return Task.FromResult(new ReplyDraft(text, null));
+        }
+    }
+
+    private sealed class InterruptSecondReceipt : IPrivateTransport, ICheckedPrivateTransport
+    {
+        private readonly QqPrivateTransport actual;
+        private int submissions;
+        internal InterruptSecondReceipt(QqPrivateTransport actual) { this.actual = actual; }
+        public string Epoch { get { return actual.Epoch; } }
+        public ReplyRow[] Read() { return actual.Read(); }
+        public void RequireReady() { actual.RequireReady(); }
+        public void Submit(string text, Action verify, Action<Action> commit) { throw new InvalidOperationException("expected checked write"); }
+        public ReplyRow[] ReadAfterSubmit(out bool draftEmpty)
+        {
+            if (submissions == 2) throw new InvalidOperationException("test-only post-submit read interruption");
+            return actual.ReadAfterSubmit(out draftEmpty);
+        }
+        public void SubmitChecked(string text, Action<ReplyRow[]> verify, Action<Action, Action> commit, Action<string> checkpoint)
+        {
+            actual.SubmitChecked(text, verify, (prepare, submit) => commit(prepare, () => { submit(); submissions++; }), checkpoint);
         }
     }
 }

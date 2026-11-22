@@ -9,6 +9,7 @@ using System.Windows.Automation;
 internal sealed class Controls
 {
     internal AutomationElement Header, Editor, EditorContainer, Button, History;
+    private AutomationElement selectedContact;
     private AutomationElement origin;
     internal List<AutomationElement> Bubbles;
     internal int NodeCount;
@@ -89,6 +90,8 @@ internal sealed class Controls
         Func<AutomationElement, string, bool> hasClass = (e, name) => classes(e).Split(' ').Contains(name);
         var result = new Controls { Source = source, NodeCount = elements.Length, origin = root };
         result.Header = Unique(elements.Where(e => hasClass(e, "chat-header__contact-name")));
+        result.selectedContact = Unique(elements.Where(e => hasClass(e, "recent-contact-item") &&
+            hasClass(e, "recent-contact-item--selected")));
         result.Editor = Unique(elements.Where(e => hasClass(e, "qq-msg-editor")));
         result.EditorContainer = result.Editor;
         if (result.Editor == null)
@@ -166,6 +169,17 @@ internal sealed class Controls
     {
         var identity = HeaderIdentity();
         return String.IsNullOrWhiteSpace(identity) ? null : MessageSnapshot.Hash(identity + "\n" + String.Join(".", Header.GetRuntimeId()));
+    }
+
+    internal string SelectedConversationProof()
+    {
+        if (selectedContact == null || !HasClass(selectedContact, "recent-contact-item--selected")) return null;
+        var parent = TreeWalker.RawViewWalker.GetParent(selectedContact);
+        if (parent == null || !HasClass(parent, "recent-contact-list")) return null;
+        var id = selectedContact.GetRuntimeId();
+        var owner = parent.GetRuntimeId();
+        if (id == null || id.Length == 0 || owner == null || owner.Length == 0) return null;
+        return MessageSnapshot.Hash(String.Join(".", owner) + "/" + String.Join(".", id));
     }
     internal string LoginEvidence(string expectedDisplay)
     {
