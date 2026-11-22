@@ -6,7 +6,7 @@ Ivy connect 基于官方 Windows QQ 客户端，在一个已经核验的私聊�
 
 ## 下载和启动
 
-在 [v1.0.0 Release](../../releases/tag/v1.0.0) 下载 `Ivy-connect-v1.0.0-win-x64.zip`。解压整个文件夹，进入 `Ivy connect 1.0` 双击 **Ivy connect.exe**。这个包内含 .NET 10 Windows Desktop 运行库。GitHub 的 **Source code (zip)** 是源码，供开发者构建。v0.8.0 的单文件实验仍按历史材料保留。
+在 [v1.0.0 Release](../../releases/tag/v1.0.0) 下载 `Ivy-connect-v1.0.0-win-x64.zip`。解压整个文件夹，进入 `Ivy connect 1.0` 双击 **Ivy connect.exe**。这个包内含 .NET 10 Windows Desktop 运行库。开发者可下载同页的 `Ivy-connect-v1.0.0-source-mit.zip`，其中包含本次开源更新和完整许可证。v0.8.0 的单文件实验仍按历史材料保留。
 
 1. 安装并登录官方 Windows QQ。把允许自动回复的私聊打开，保持窗口展开。
 2. 在主界面填写**电脑端自动回复账号**和**给它发消息的聊天对象**。点击「连接 QQ」。如果 APP 要求核验，用界面指明的聊天对象账号向电脑端回复账号发送显示的五位数字。
@@ -26,6 +26,10 @@ Ivy connect 基于官方 Windows QQ 客户端，在一个已经核验的私聊�
 - v1.0.0 使用 v0.8.0 的 QQ 收发与模型逻辑，并沿用原有绑定、状态和密钥存储。详见 [正式验收](docs/正式验收.md)。
 - v0.8.0 的本机记录包含 DeepSeek 真实调用、两轮上下文，以及单个授权私聊的机器人端本地确认和对方收件确认。其他厂商预设或模拟测试不等于真实 API 已验证。
 - 一次只处理一个核验通过的文字私聊。真正最小化发送、群聊、多联系人路由、其他 Windows 架构和长期运行稳定性仍超出已验证范围。
+
+## 许可
+
+Ivy connect 的源代码、项目所有者授权的原始软件图标、默认遮罩和自有品牌图片采用 [MIT License](LICENSE)，Copyright (c) 2026 chernobyledk。第三方组件和资源沿用各自的许可证及版权声明。详见 [第三方与资源声明](docs/THIRD_PARTY_NOTICES.md)。
 
 ## 开发
 

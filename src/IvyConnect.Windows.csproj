@@ -29,6 +29,10 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="*.cs" />
+    <None Include="..\LICENSE" Link="LICENSE" CopyToPublishDirectory="Always" />
+    <None Include="..\docs\LICENSE.dotnet.txt" Link="LICENSE.dotnet.txt" CopyToPublishDirectory="Always" />
+    <None Include="..\docs\ThirdPartyNotices.dotnet.txt" Link="ThirdPartyNotices.dotnet.txt" CopyToPublishDirectory="Always" />
+    <None Include="..\docs\THIRD_PARTY_NOTICES.md" Link="THIRD_PARTY_NOTICES.md" CopyToPublishDirectory="Always" />
     <Compile Include="$(QaEntry)" Condition="'$(QaEntry)' != ''" />
     <EmbeddedResource Include="assets\launcher.ico" LogicalName="QQPrivateApp.LauncherIcon" />
     <EmbeddedResource Include="assets\cover.jpg" LogicalName="QQPrivateApp.DefaultCover" />

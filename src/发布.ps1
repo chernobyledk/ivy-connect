@@ -14,7 +14,9 @@ if (Test-Path -LiteralPath $Destination) {
 if ($LASTEXITCODE) { throw "dotnet publish 失败，退出码 $LASTEXITCODE" }
 
 $entry = Join-Path $Destination 'Ivy connect.exe'
-foreach ($file in @($entry, (Join-Path $Destination 'coreclr.dll'), (Join-Path $Destination 'System.Windows.Forms.dll'))) {
+foreach ($file in @($entry, (Join-Path $Destination 'coreclr.dll'), (Join-Path $Destination 'System.Windows.Forms.dll'),
+    (Join-Path $Destination 'LICENSE'), (Join-Path $Destination 'LICENSE.dotnet.txt'),
+    (Join-Path $Destination 'ThirdPartyNotices.dotnet.txt'), (Join-Path $Destination 'THIRD_PARTY_NOTICES.md'))) {
     if (!(Test-Path -LiteralPath $file -PathType Leaf)) { throw "发布结果缺少 $([IO.Path]::GetFileName($file))" }
 }
 if ((Get-Item -LiteralPath $entry).VersionInfo.ProductVersion -ne '1.0.0') {
