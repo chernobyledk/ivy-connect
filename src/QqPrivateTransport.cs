@@ -58,6 +58,11 @@ internal sealed class QqPrivateTransport : IPrivateTransport, IDisposable
 
     private T ReadStable<T>(Func<T> read)
     {
+        return ReadStable(read, guard, log);
+    }
+
+    private static T ReadStable<T>(Func<T> read, Action guard, Action<string> log)
+    {
         for (int attempt = 0; ; attempt++)
         {
             guard();
@@ -168,30 +173,38 @@ internal sealed class QqPrivateTransport : IPrivateTransport, IDisposable
         var target = Target.FromKnownHandle(hwnd);
         if (!Native.Visible(target.Hwnd) || Native.IsIconic(target.Hwnd))
             throw new InvalidOperationException("请打开机器人的展开私聊窗口");
-        var binding = new Binding(target, false);
-        var first = binding.RequireMatch();
-        var login = first.LoginEvidence(botDisplay);
-        if (String.IsNullOrEmpty(login) || first.HeaderIdentity() != peerDisplay || !first.EmptyDraft())
-            throw new InvalidOperationException("登录头像、聊天名称或空草稿核验未通过");
+        var binding = ReadStable(() => new Binding(target, false), token.ThrowIfCancellationRequested, log);
+        var initial = ReadStable(() => {
+            var ui = binding.RequireMatch();
+            var login = ui.LoginEvidence(botDisplay);
+            if (String.IsNullOrEmpty(login) || ui.HeaderIdentity() != peerDisplay ||
+                ui.HasVisibleConnectionWarning() || !ui.EmptyDraft())
+                throw new InvalidOperationException("登录头像、聊天名称、网络或空草稿核验未通过");
+            return Tuple.Create(login, ui.ReplyRows());
+        }, token.ThrowIfCancellationRequested, log);
         var timeline = new ReplyTimeline();
-        var before = first.ReplyRows();
+        var before = initial.Item2;
         if (before.Any(row => row.Text == MessageSnapshot.Normalize(challenge)))
             throw new InvalidOperationException("验证编号已出现在历史中");
         if (token.WaitHandle.WaitOne(350)) token.ThrowIfCancellationRequested();
-        timeline.Seed(before, binding.RequireMatch().ReplyRows());
+        timeline.Seed(before, ReadStable(() => binding.RequireMatch().ReplyRows(), token.ThrowIfCancellationRequested, log));
         log("enrollment baseline established");
         while (true)
         {
             if (token.WaitHandle.WaitOne(340)) token.ThrowIfCancellationRequested();
             if (!Native.Visible(target.Hwnd) || Native.IsIconic(target.Hwnd))
                 throw new InvalidOperationException("核验期间 QQ 窗口状态变化");
-            var ui = binding.RequireMatch();
-            if (ui.LoginEvidence(botDisplay) != login || ui.HasVisibleConnectionWarning() || !ui.EmptyDraft())
-                throw new InvalidOperationException("核验期间账号、草稿或连接状态变化");
-            var hits = timeline.Advance(ui.ReplyRows()).Where(row => row.Text == MessageSnapshot.Normalize(challenge)).ToArray();
+            var snapshot = ReadStable(() => {
+                var ui = binding.RequireMatch();
+                if (ui.LoginEvidence(botDisplay) != initial.Item1 || ui.HeaderIdentity() != peerDisplay ||
+                    ui.HasVisibleConnectionWarning() || !ui.EmptyDraft())
+                    throw new InvalidOperationException("核验期间账号、会话、草稿或连接状态变化");
+                return ui.ReplyRows();
+            }, token.ThrowIfCancellationRequested, log);
+            var hits = timeline.Advance(snapshot).Where(row => row.Text == MessageSnapshot.Normalize(challenge)).ToArray();
             if (hits.Length == 0) continue;
             if (hits.Length != 1 || hits[0].Own != false) throw new InvalidOperationException("来信核验编号不唯一或方向错误");
-            return Capture(target, binding, bot, peer, botDisplay, peerDisplay, login, MessageSnapshot.Hash(hits[0].Anchor));
+            return Capture(target, binding, bot, peer, botDisplay, peerDisplay, initial.Item1, MessageSnapshot.Hash(hits[0].Anchor));
         }
     }
 

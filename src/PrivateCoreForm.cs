@@ -28,12 +28,14 @@ internal sealed class PrivateCoreForm : Form
     {
         this.folder = folder;
         Text = "QQ 自动回复 · 单私聊 AI";
-        ClientSize = new Size(605, 362);
-        MinimumSize = new Size(590, 356);
+        ClientSize = new Size(605, 432);
+        MinimumSize = new Size(590, 446);
         StartPosition = FormStartPosition.CenterScreen;
-        var grid = new TableLayoutPanel { Dock = DockStyle.Top, Height = 182, Padding = new Padding(8), ColumnCount = 2 };
+        var grid = new TableLayoutPanel { Dock = DockStyle.Top, Height = 214, Padding = new Padding(8),
+            ColumnCount = 2, RowCount = 6, GrowStyle = TableLayoutPanelGrowStyle.FixedSize };
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 60));
+        for (int row = 0; row < 6; row++) grid.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
         var labels = new[] { "机器人登录 QQ 号", "允许回复的对象 QQ 号", "机器人的登录显示名",
             "私聊会话显示名", "QQ 窗口句柄（十进制）" };
         for (int i = 0; i < labels.Length; i++)
@@ -42,6 +44,7 @@ internal sealed class PrivateCoreForm : Form
             fields[i].Dock = DockStyle.Fill;
             grid.Controls.Add(fields[i], 1, i);
         }
+        attested.Anchor = AnchorStyles.Left;
         grid.Controls.Add(attested, 0, 5);
         grid.SetColumnSpan(attested, 2);
         var buttons = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 68, Padding = new Padding(6) };
@@ -161,7 +164,10 @@ internal sealed class PrivateCoreForm : Form
                             throw new InvalidOperationException("此状态目录只允许原核验账号对");
                         var marker = "QQ验证绑定 " + Guid.NewGuid().ToString("N").Substring(0, 12).ToUpperInvariant();
                         store.State.Binding = QqPrivateTransport.Enroll(window, a[0], a[1], a[2], a[3],
-                            marker, pending.Token, text => { Log(text); Report("请由已核对的对象发送 " + marker); });
+                            marker, pending.Token, text => {
+                                Log(text);
+                                if (text == "enrollment baseline established") Report("请由已核对的对象发送 " + marker);
+                            });
                         pending.Token.ThrowIfCancellationRequested();
                         store.Save();
                         Log("enrollment complete");
