@@ -4,7 +4,7 @@ using System.Linq;
 
 internal sealed class ReplyRow
 {
-    internal readonly string Key, Digest, Text;
+    internal readonly string Key, Digest, Text, RawText;
     internal readonly int Segments;
     internal readonly bool? Own;
     internal ReplyRow(string key, string[] parts, bool? own = null)
@@ -12,7 +12,8 @@ internal sealed class ReplyRow
         Key = key;
         Segments = parts.Length;
         Own = own;
-        Text = MessageSnapshot.Normalize(String.Concat(parts));
+        RawText = String.Concat(parts);
+        Text = MessageSnapshot.Normalize(RawText);
         Digest = MessageSnapshot.Hash(Text);
     }
     internal string Anchor { get { return Key + "/" + Digest; } }

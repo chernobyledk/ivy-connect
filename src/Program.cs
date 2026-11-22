@@ -33,11 +33,22 @@ internal static partial class Program
                 && arguments[0] == "--self-test";
             bool continuous = (arguments.Length == 1 || arguments.Length == 2) && arguments[0] == "--continuous";
             bool external = arguments.Length == 2 && arguments[0] == "--external-private";
+            bool privateLive = arguments.Length == 2 && arguments[0] == "--private-live-check";
+            bool privateForm = arguments.Length == 0 || arguments.Length == 1 && arguments[0] == "--private-core";
+            bool legacyLab = arguments.Length == 1 && arguments[0] == "--r5-lab";
             if (arguments.Length != 0 && !autoMatrix && !awaitSelf && !typingPad && !baseline && !round2 &&
-                !region && !finishRegion && !msaaWitness && !fullOcclusionWitness && !continuous && !selfTest && !selfPad && !external)
+                !region && !finishRegion && !msaaWitness && !fullOcclusionWitness && !continuous && !selfTest && !selfPad && !external &&
+                !privateLive && !privateForm && !legacyLab)
                 return RunCommand(arguments);
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+            if (privateLive) { Application.Run(new PrivateLiveCheck(arguments[1])); return 0; }
+            if (privateForm)
+            {
+                Application.Run(new PrivateCoreForm(Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "QQPrivateApp", "phase1")));
+                return 0;
+            }
             if (external) { Application.Run(new ExternalPrivateForm(arguments[1])); return 0; }
             if (typingPad) { TypingPad.Show(arguments); return 0; }
             if (selfPad) { TypingPad.ShowAutomatic(arguments); return 0; }

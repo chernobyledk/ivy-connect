@@ -22,9 +22,10 @@ internal sealed class ExternalPrivateScope
     private string mappingFile;
     private Action<string> log;
 
-    internal ExternalPrivateScope(string file)
+    internal ExternalPrivateScope(string file) : this(File.ReadAllLines(file, Encoding.UTF8)) { }
+
+    internal ExternalPrivateScope(string[] lines)
     {
-        var lines = File.ReadAllLines(file, Encoding.UTF8);
         if (lines.Length != 7 && lines.Length != 9) throw new InvalidOperationException("测试配置应有七行或九行");
         Window = Int64.Parse(lines[0]);
         Code = lines[1];

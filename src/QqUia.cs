@@ -125,6 +125,18 @@ internal sealed class Controls
     {
         return Header == null ? null : Header.Current.Name.Trim();
     }
+    internal string LoginEvidence(string expectedDisplay)
+    {
+        if (String.IsNullOrWhiteSpace(expectedDisplay)) return null;
+        var avatar = Unique(Nodes(origin, TreeScope.Descendants, new AndCondition(
+            Is(AutomationElement.ControlTypeProperty, ControlType.Button),
+            Is(AutomationElement.NameProperty, expectedDisplay + "的头像"))));
+        if (avatar == null) return null;
+        var id = avatar.GetRuntimeId();
+        if (id == null || id.Length == 0) return null;
+        // The account number came from the operator/challenge. The avatar is a pinned UI locator.
+        return MessageSnapshot.Hash(expectedDisplay + "\n" + String.Join(".", id));
+    }
 
     internal bool HasVisibleConnectionWarning()
     {
