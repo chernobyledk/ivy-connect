@@ -27,7 +27,7 @@ internal static class LabEntry
             catch (AbandonedMutexException) { entered = true; }
             if (!entered)
             {
-                MessageBox.Show("稳定版或实验版已经打开。请从主窗或托盘退出该窗口，再打开此版本。",
+                MessageBox.Show("Ivy connect 的另一实例已经打开。请从主窗或托盘退出已有实例，再打开此版本。",
                     "Ivy connect · 已在使用", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return 2;
             }
@@ -69,7 +69,7 @@ internal static class LabData
     internal static void BackupBeforeFirstRun(string folder)
     {
         var parent = Directory.GetParent(folder).FullName;
-        var completed = Path.Combine(parent, "备份", "首次使用-v0.8.0");
+        var completed = Path.Combine(parent, "备份", "首次使用-v1.0.0");
         if (File.Exists(Path.Combine(completed, "备份完成.txt"))) return;
         if (!Array.Exists(ProtectedFiles, file => File.Exists(Path.Combine(folder, file)))) return;
         if (Directory.Exists(completed)) throw new IOException("Incomplete backup requires review");

@@ -63,7 +63,7 @@ internal sealed class PrivateCoreForm : Form
     {
         this.folder = folder;
         this.acceptIncoming = acceptIncoming ?? (_ => true);
-        Text = "Ivy connect v" + Application.ProductVersion;
+        Text = "Ivy connect 1.0";
         launcherIcon = PresentationAssets.ReadIcon();
         Icon = launcherIcon;
         tray.Icon = launcherIcon;
@@ -202,7 +202,7 @@ internal sealed class PrivateCoreForm : Form
         header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         if (!SystemInformation.HighContrast) header.BackColor = Color.White;
         var title = new Label { Text = "Ivy connect", AutoSize = true, Font = LabTheme.Font(18, FontStyle.Bold), Margin = Padding.Empty };
-        var version = new Label { Text = "v" + Application.ProductVersion + "  ·  发布实验版", AutoSize = true, Font = LabTheme.Font(9), Margin = Padding.Empty };
+        var version = new Label { Text = "v" + Application.ProductVersion, AutoSize = true, Font = LabTheme.Font(9), Margin = Padding.Empty };
         var identity = new TableLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, ColumnCount = 1, Margin = Padding.Empty };
         identity.Controls.Add(title);
         identity.Controls.Add(version);
@@ -231,15 +231,19 @@ internal sealed class PrivateCoreForm : Form
 
         var openData = new Button { Text = "打开数据目录" };
         var backup = new Button { Text = "备份本机数据" };
+        var about = new Button { Text = "关于 Ivy connect" };
         LabTheme.StyleButton(openData);
         LabTheme.StyleButton(backup);
+        LabTheme.StyleButton(about);
         openData.Click += (s, e) => DataAction(false);
         backup.Click += (s, e) => DataAction(true);
+        about.Click += (s, e) => MessageBox.Show(this, Text + "\r\n版本 v" + Application.ProductVersion +
+            "\r\nWindows QQ 单私聊自动回复", "关于 Ivy connect", MessageBoxButtons.OK, MessageBoxIcon.Information);
         fields[4].ReadOnly = true;
         fields[4].Width = 175;
         fields[4].AccessibleName = "自动获取的窗口句柄";
         diagnostics.Controls.Add(LabTheme.Row(new Label { Text = "自动取得的窗口句柄", AutoSize = true }, fields[4], pickQq));
-        diagnostics.Controls.Add(LabTheme.Row(openData, backup, clearContext));
+        diagnostics.Controls.Add(LabTheme.Row(openData, backup, clearContext, about));
 
         var body = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
             ColumnCount = 1, Padding = new Padding(14, 8, 14, 12), TabIndex = 0 };

@@ -7,7 +7,7 @@ using System.Runtime.Versioning;
 
 [assembly: AssemblyTitle("Ivy connect")]
 [assembly: AssemblyProduct("Ivy connect")]
-[assembly: AssemblyDescription("Ivy connect desktop QQ auto-reply – release experiment")]
-[assembly: AssemblyVersion("0.8.0.0")]
-[assembly: AssemblyFileVersion("0.8.0.0")]
-[assembly: AssemblyInformationalVersion("0.8.0")]
+[assembly: AssemblyDescription("Ivy connect desktop QQ single-chat auto-reply")]
+[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyInformationalVersion("1.0.0")]

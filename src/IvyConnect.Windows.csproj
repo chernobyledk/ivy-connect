@@ -11,17 +11,20 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <StartupObject Condition="'$(StartupObject)' == ''">LabEntry</StartupObject>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
-    <AssemblyName>启动器</AssemblyName>
+    <AssemblyName>Ivy connect</AssemblyName>
     <AssemblyTitle>Ivy connect</AssemblyTitle>
     <Product>Ivy connect</Product>
-    <Description>Ivy connect 桌面 QQ 自动回复 · 发布实验版</Description>
-    <Version>0.8.0</Version>
+    <Description>Ivy connect 桌面 QQ 单私聊自动回复</Description>
+    <Version>1.0.0</Version>
+    <FileVersion>1.0.0.0</FileVersion>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
     <ApplicationIcon>assets\launcher.ico</ApplicationIcon>
     <ApplicationManifest>IvyConnect.manifest</ApplicationManifest>
     <PublishTrimmed>false</PublishTrimmed>
     <PublishAot>false</PublishAot>
     <PublishReadyToRun>false</PublishReadyToRun>
     <DebugType>embedded</DebugType>
+    <PathMap>$(MSBuildProjectDirectory)=/_/src</PathMap>
     <RuntimeFrameworkVersion>10.0.15</RuntimeFrameworkVersion>
   </PropertyGroup>
   <ItemGroup>
